@@ -39,6 +39,11 @@ emulator.
 > game. Rockstar Games and Take-Two own *Red Dead Revolver*; this project is not
 > affiliated with or endorsed by them.
 
+> **Only the PAL (Europe) Xbox release works.** The port is recompiled from
+> that exact executable: its `default.xbe` is **4,452,352 bytes**. Other
+> versions (for example the NTSC/USA one, 4,403,200 bytes) are not supported;
+> the game tells you so at startup instead of running.
+
 ### Features
 
 - Runs at the game's 60 Hz with GPU rendering, internal resolution up to 4x
@@ -123,6 +128,11 @@ emulador.
 > **No incluye archivos del juego.** Necesitás tu propia copia legítima del
 > juego de Xbox. *Red Dead Revolver* es de Rockstar Games y Take-Two; este
 > proyecto no está afiliado ni avalado por ellos.
+
+> **Solo funciona la versión PAL (Europa) de Xbox.** El port está recompilado
+> desde ese ejecutable exacto: su `default.xbe` pesa **4.452.352 bytes**. Otras
+> versiones (por ejemplo la NTSC/EE. UU., de 4.403.200 bytes) no son
+> compatibles; el juego lo avisa al arrancar en vez de abrirse.
 
 ### Qué tiene
 

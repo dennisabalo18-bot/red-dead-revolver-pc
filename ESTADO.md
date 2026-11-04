@@ -1032,3 +1032,17 @@ Lista vieja:
   `dist\descargas\`, sin comprimir, con sus carpetas `texturas\` y `videos\` para descomprimir en `Mods-Extras\`).
   Publicado como `f43ff49` (padre `31ae08b`, autor anónimo; etiqueta local `publicado-github`). Verificado en la
   página: las 9 imágenes cargan y los dos enlaces de Drive abren el archivo.
+
+## Chequeo de versión del juego (2026-11-04, compilado, sin probar con otra versión)
+
+- **Issue en GitHub (AriKaeli843):** el exe se cerraba al abrirlo. Su registro: `XBE loaded: 4403200 bytes`
+  (el nuestro: 4452352), secciones en otras direcciones (`.rdata` en 0x003C5360, la nuestra 0x003CF520) y llamadas
+  indirectas a "direcciones" que son texto (0x63417773 = "swAc", 0x70657453 = "Step"), luego acceso inválido.
+  Es otra versión del juego (probablemente NTSC/EE. UU.); el port es del `default.xbe` PAL (Europa, región 4,
+  versión 3, título 5454001A).
+- **`main.c`:** `rdr_xbe_supported` compara tamaño (4452352) y FNV-1a 64 de todo el archivo (0x0D9B321F12DBAF37);
+  si no coincide, `rdr_report_wrong_xbe` muestra un aviso en español e inglés (MessageBoxW, UTF-8) y sale.
+  `RDR_XBE_ANY=1` lo saltea. Registro: `[FATAL] load XBE: unsupported game version (N bytes)`.
+- README (inglés y español) y LEEME del jugador: solo la versión PAL, con el tamaño del `default.xbe`.
+- Exe y LEEME copiados a la carpeta final; `RedDeadRevolverPC.zip` rehecho (hay que reemplazarlo en el Release).
+  Copias previas en `modding/backup_chequeo_xbe/`.

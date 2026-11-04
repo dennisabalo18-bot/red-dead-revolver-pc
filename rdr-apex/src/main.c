@@ -996,6 +996,48 @@ static void host_report_fatal(const char *step, const char *detail)
 #endif
 }
 
+/* rdr-port: the code was recompiled from one exact default.xbe, the PAL
+ * (Europe) release, region "rest of the world", version 3. Any other build
+ * (the NTSC one is 4,403,200 bytes) has its code and data elsewhere and dies
+ * at the first indirect call, so say so and stop. RDR_XBE_ANY=1 skips the
+ * check (development). FNV-1a 64 of the whole file. */
+#define RDR_XBE_SIZE 4452352u
+#define RDR_XBE_FNV  0x0D9B321F12DBAF37ull
+
+static int rdr_xbe_supported(const uint8_t *data, size_t size)
+{
+    const char *any = getenv("RDR_XBE_ANY");
+    uint64_t h = 0xcbf29ce484222325ull;
+    size_t i;
+    if (any && *any == '1')
+        return 1;
+    if (size != RDR_XBE_SIZE)
+        return 0;
+    for (i = 0; i < size; i++)
+        h = (h ^ data[i]) * 0x100000001b3ull;
+    return h == RDR_XBE_FNV;
+}
+
+static void rdr_report_wrong_xbe(size_t size)
+{
+    char msg[1200];
+    snprintf(msg, sizeof msg,
+             "Tu copia de Red Dead Revolver es otra versión del juego (default.xbe de %zu bytes).\n"
+             "Este port solo funciona con la versión PAL (Europa) de Xbox: default.xbe de %u bytes.\n\n"
+             "Your copy of Red Dead Revolver is a different version of the game (default.xbe, %zu bytes).\n"
+             "This port only works with the PAL (Europe) Xbox release: default.xbe, %u bytes.",
+             size, RDR_XBE_SIZE, size, RDR_XBE_SIZE);
+    fprintf(stderr, "[FATAL] load XBE: unsupported game version (%zu bytes)\n", size);
+    fflush(stderr);
+#if defined(_WIN32)
+    if (!recomp_env_on(RENV_HEADLESS)) {
+        wchar_t w[1200];
+        if (MultiByteToWideChar(CP_UTF8, 0, msg, -1, w, (int)(sizeof w / sizeof w[0])))
+            MessageBoxW(NULL, w, L"Red Dead Revolver PC", MB_ICONERROR);
+    }
+#endif
+}
+
 /* ── Boot sequence (shared) ────────────────────────────────── */
 
 /* RECOMP_STDIO_LOG and unbuffered stdio, from the entry points: before any
@@ -1108,6 +1150,11 @@ static int host_main(void)
         return 1;
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
+    if (!rdr_xbe_supported(xbe_data, xbe_size)) {
+        rdr_report_wrong_xbe(xbe_size);
+        free(xbe_data);
+        return 1;
+    }
 
     /* rdr-port: "Modo experimental" (rdr_menu.ini) turns on run_ahead before
      * the memory layout starts the walker, which reads it once. */

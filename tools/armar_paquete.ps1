@@ -71,6 +71,8 @@ En el juego:  F2 menú de ajustes   F6 texturas mejoradas sí/no   F11 pantalla 
               F9 libera el ratón
 
 No incluye ningún archivo del juego. Necesitás tu propia copia legítima.
+Solo funciona la versión PAL (Europa) de Xbox: su default.xbe pesa 4.452.352 bytes.
+Con otra versión (por ejemplo la NTSC de EE. UU.) el juego lo avisa al arrancar y no se abre.
 extract-xiso es de in@fishtank.com (licencia en Herramientas\extract-xiso).
 "@, $utf8)
 # El .bat sin BOM (cmd no lo entiende) y con chcp 65001 para los acentos.
