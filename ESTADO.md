@@ -1016,3 +1016,13 @@ Lista vieja:
 - Datos útiles si se retoma: la textura del mando es `1BA085E83C2A7AEA` (256x256, opaca, guardada al revés);
   White = L1/Q, Black = R1/F. El mecanismo de imagen plana sigue en el historial del fork (`e339218`).
 - La partida del usuario sigue respaldada en `C:\Emuladores y Juegos\Red Dead Revolver PC\Respaldo partida 2026-11-04`.
+
+## Publicado en GitHub (2026-11-04)
+
+- Repositorio: https://github.com/dennisabalo18-bot/red-dead-revolver-pc (remoto `origin`).
+- Se subió **un solo commit** (`31ae08b`, etiqueta local `publicado-github`) con el árbol de `d8f6d50`, autor
+  `dennisabalo18-bot <dennisabalo18-bot@users.noreply.github.com>`: el usuario no quiere su correo público (los
+  commits locales lo tienen). El historial local queda igual y no se sube.
+- Para subir cambios después: otro commit sobre `publicado-github` con el árbol nuevo y el mismo autor anónimo
+  (`git commit-tree <arbol> -p publicado-github`), nunca `git push` de `gpu-d3d11`.
+- Falta: el Release con `dist\RedDeadRevolverPC.zip` y los enlaces de Google Drive (texturas, videos) en el README.

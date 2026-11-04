@@ -2,6 +2,28 @@
 
 **[English](#english) · [Español](#español)**
 
+<p align="center"><img src="docs/img/juego.gif" alt="Red Dead Revolver running on PC" width="560"></p>
+
+| | |
+|:---:|:---:|
+| ![Title](docs/img/titulo.jpg) | ![Menu](docs/img/menu.jpg) |
+| ![Tutorial](docs/img/tutorial.jpg) | |
+
+**Original textures → improved textures (F6)**
+
+| Original | Improved / Mejoradas |
+|:---:|:---:|
+| ![Town, original](docs/img/pueblo1_antes.jpg) | ![Town, improved](docs/img/pueblo1_despues.jpg) |
+| ![Town 2, original](docs/img/pueblo2_antes.jpg) | ![Town 2, improved](docs/img/pueblo2_despues.jpg) |
+
+### Downloads / Descargas
+
+| | |
+|---|---|
+| **Game port / Port del juego** (required / obligatorio) | [RedDeadRevolverPC.zip — Releases](https://github.com/dennisabalo18-bot/red-dead-revolver-pc/releases/latest) |
+| **Improved textures / Texturas mejoradas** (optional, 2.7 GB) | [RDR-PC-Texturas.zip — Google Drive](https://drive.google.com/file/d/1eiFxd7sHNGc7IdHdqkKh95KRyHEnVx5A/view?usp=sharing) |
+| **Remastered videos / Videos mejorados** (optional, 1 GB) | [RDR-PC-Videos.zip — Google Drive](https://drive.google.com/file/d/1bS0AZgfILsd5EulgOEys5Ll3LKs9uKai/view?usp=sharing) |
+
 ---
 
 ## English
@@ -48,9 +70,9 @@ Red Dead Revolver PC\
 1. Download `RedDeadRevolverPC.zip` from **Releases** and unzip it.
 2. Put your game in `Game\`: drag your Xbox ISO onto `Instalar juego desde ISO.bat`,
    or copy the already extracted files there (a folder inside it is fine).
-3. Optional: download the improved textures and videos (links on the release
-   page) and paste them as they come: `textures.pack` in
-   `Mods-Extras\texturas\`, the `.mp4` files in `Mods-Extras\videos\`.
+3. Optional: download the improved textures and videos (see **Downloads**
+   above) and unzip both inside `Mods-Extras\`: they already bring their
+   `texturas\` and `videos\` folders.
 4. Open `Configuración.exe`, choose your settings and press **JUGAR**.
 
 In game: **F2** settings · **F6** improved textures on/off · **F11** fullscreen ·
@@ -134,9 +156,9 @@ Red Dead Revolver PC\
 2. Poné tu juego en `Game\`: arrastrá tu ISO de Xbox sobre
    `Instalar juego desde ISO.bat`, o copiá ahí los archivos ya descomprimidos
    (puede ir dentro de otra carpeta).
-3. Opcional: bajá las texturas y los videos mejorados (links en la página del
-   release) y pegalos tal cual: `textures.pack` en `Mods-Extras\texturas\`,
-   los `.mp4` en `Mods-Extras\videos\`.
+3. Opcional: bajá las texturas y los videos mejorados (ver **Descargas**, arriba)
+   y descomprimí los dos dentro de `Mods-Extras\`: ya traen sus carpetas
+   `texturas\` y `videos\`.
 4. Abrí `Configuración.exe`, elegí los ajustes y tocá **JUGAR**.
 
 En el juego: **F2** ajustes · **F6** texturas mejoradas sí/no · **F11**
