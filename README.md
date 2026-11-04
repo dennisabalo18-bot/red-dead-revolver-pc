@@ -2,12 +2,11 @@
 
 **[English](#english) · [Español](#español)**
 
-<p align="center"><img src="docs/img/juego.gif" alt="Red Dead Revolver running on PC" width="560"></p>
+<p align="center"><img src="docs/img/juego.gif" alt="Red Dead Revolver running on PC" width="480"></p>
 
 | | |
 |:---:|:---:|
 | ![Title](docs/img/titulo.jpg) | ![Menu](docs/img/menu.jpg) |
-| ![Tutorial](docs/img/tutorial.jpg) | |
 
 **Original textures → improved textures (F6)**
 

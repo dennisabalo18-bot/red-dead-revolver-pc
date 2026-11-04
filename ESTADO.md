@@ -1026,3 +1026,9 @@ Lista vieja:
 - Para subir cambios después: otro commit sobre `publicado-github` con el árbol nuevo y el mismo autor anónimo
   (`git commit-tree <arbol> -p publicado-github`), nunca `git push` de `gpu-d3d11`.
 - Falta: el Release con `dist\RedDeadRevolverPC.zip` y los enlaces de Google Drive (texturas, videos) en el README.
+- **README con imágenes y descargas (2026-11-04):** `docs/img/` (7 capturas del usuario a 1280 en JPG y
+  `juego.gif`, 8 s del pueblo con texturas mejoradas, 560 px, 4,6 MB, de su video `Mi video.mp4`). Tabla de
+  descargas: Release (`releases/latest`), `RDR-PC-Texturas.zip` y `RDR-PC-Videos.zip` en Google Drive (armados en
+  `dist\descargas\`, sin comprimir, con sus carpetas `texturas\` y `videos\` para descomprimir en `Mods-Extras\`).
+  Publicado como `f43ff49` (padre `31ae08b`, autor anónimo; etiqueta local `publicado-github`). Verificado en la
+  página: las 9 imágenes cargan y los dos enlaces de Drive abren el archivo.
