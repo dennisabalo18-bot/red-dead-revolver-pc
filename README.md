@@ -1,6 +1,7 @@
 # Red Dead Revolver — PC port (Xbox static recompilation)
 
 **[English](#english) · [Español](#español)**
+(Xbox, PAL/Europe version)
 
 <p align="center"><img src="docs/img/juego.gif" alt="Red Dead Revolver running on PC" width="480"></p>
 
