@@ -1,0 +1,123 @@
+From 5ef4a0d5f8f96d33b0c2fa7e9181214be6af0b30 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:40:11 -0300
+Subject: [PATCH 13/47] kernel: XC_LANGUAGE from RECOMP_LANGUAGE and the F2
+ menu
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/host_menu.c      | 16 ++++++++++++++++
+ src/kernel/kernel.h      |  5 +++++
+ src/kernel/kernel_xbox.c | 31 +++++++++++++++++++++++++++++--
+ 3 files changed, 50 insertions(+), 2 deletions(-)
+
+diff --git a/src/d3d/host_menu.c b/src/d3d/host_menu.c
+index e0faa39..cc7c9d2 100644
+--- a/src/d3d/host_menu.c
++++ b/src/d3d/host_menu.c
+@@ -21,6 +21,8 @@
+ /* kernel.h, declared here: it does not mix with <windows.h>. */
+ void xbox_VideoWidescreenSet(int on);
+ int  xbox_VideoWidescreen(void);
++void xbox_LanguageSet(int lang);
++int  xbox_Language(void);
+ #include "input/keyboard.h"
+ #include "input/mouse.h"
+ 
+@@ -70,6 +72,19 @@ static const char *const k_wide[] = { "No (4:3)", "Sí (nativo del juego)", NULL
+ static int get_wide(void) { return xbox_VideoWidescreen() != 0; }
+ static void set_wide(int i) { xbox_VideoWidescreenSet(i); }
+ 
++/* XC_LANGUAGE (kernel.h): the title picks its text and voices at boot. */
++static const char *const k_lang[] = { "English", "Español", "Français", "Deutsch", "Italiano", NULL };
++static const int k_lang_id[] = { 1, 5, 4, 3, 6 };
++static int get_lang(void)
++{
++    int i;
++    for (i = 0; i < 5; i++)
++        if (k_lang_id[i] == xbox_Language())
++            return i;
++    return 0;
++}
++static void set_lang(int i) { xbox_LanguageSet(k_lang_id[i]); }
++
+ static const char *const k_window[] = {
+     "Libre", "640x480", "800x600", "960x720", "1024x768", "1280x720", "1280x960",
+     "1366x768", "1440x1080", "1600x900", "1600x1200", "1920x1080", "2560x1080",
+@@ -158,6 +173,7 @@ static const xbox_menu_item k_builtin[] = {
+     { "snap_2d", "HUD alineado a píxel", k_snap, get_snap, set_snap },
+     { "glow", "Brillo a pantalla completa", k_glow, get_glow, set_glow },
+     { NULL, "Juego", NULL, NULL, NULL },
++    { "language", "Idioma (al reiniciar)", k_lang, get_lang, set_lang },
+     { NULL, "Velocidad", k_speed, get_speed, set_speed },
+ };
+ 
+diff --git a/src/kernel/kernel.h b/src/kernel/kernel.h
+index 29ffc10..7c4c27d 100644
+--- a/src/kernel/kernel.h
++++ b/src/kernel/kernel.h
+@@ -1328,6 +1328,11 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
+ void xbox_VideoWidescreenSet(int on);
+ int  xbox_VideoWidescreen(void);
+ 
++/* rdr-port: the XC_LANGUAGE the title reads (1 English .. 6 Italian), from
++ * RECOMP_LANGUAGE or the F2 menu; it picks its language at boot. */
++void xbox_LanguageSet(int lang);
++int  xbox_Language(void);
++
+ /* Unknown ordinals - stub */
+ VOID    __stdcall xbox_Unknown_8(void);
+ VOID    __stdcall xbox_Unknown_23(void);
+diff --git a/src/kernel/kernel_xbox.c b/src/kernel/kernel_xbox.c
+index 1dcb6e5..36baeba 100644
+--- a/src/kernel/kernel_xbox.c
++++ b/src/kernel/kernel_xbox.c
+@@ -32,6 +32,33 @@ int xbox_VideoWidescreen(void)
+     return s_widescreen;
+ }
+ 
++/* rdr-port: the dashboard language (XC_LANGUAGE, kernel.h): 1 English,
++ * 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian. RECOMP_LANGUAGE
++ * takes the number or en/ja/de/fr/es/it; the F2 menu sets it too. */
++static int s_language;
++
++void xbox_LanguageSet(int lang)
++{
++    s_language = lang >= 1 && lang <= 6 ? lang : 1;
++}
++
++int xbox_Language(void)
++{
++    if (!s_language) {
++        static const char *const codes[] = { "en", "ja", "de", "fr", "es", "it" };
++        const char *e = getenv("RECOMP_LANGUAGE");
++        int i;
++        s_language = 1;
++        if (e && *e >= '1' && *e <= '6' && !e[1])
++            s_language = *e - '0';
++        else if (e && e[0] && e[1])
++            for (i = 0; i < 6; i++)
++                if ((e[0] | 0x20) == codes[i][0] && (e[1] | 0x20) == codes[i][1])
++                    s_language = i + 1;
++    }
++    return s_language;
++}
++
+ /* ============================================================================
+  * Exported Data Objects
+  *
+@@ -232,9 +259,9 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
+ 
+     switch (ValueIndex) {
+     case XC_LANGUAGE:
+-        /* English = 1 */
++        /* English = 1 unless RECOMP_LANGUAGE or the F2 menu says otherwise */
+         if (ValueLength >= sizeof(ULONG)) {
+-            *(PULONG)Value = 1;
++            *(PULONG)Value = (ULONG)xbox_Language();
+             if (Type) *Type = 4; /* REG_DWORD */
+             if (ResultLength) *ResultLength = sizeof(ULONG);
+         }
+-- 
+2.55.0.windows.3
+

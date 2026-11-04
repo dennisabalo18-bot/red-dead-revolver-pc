@@ -1,0 +1,121 @@
+From 9326956a6fd1cabddf435db0831291d3e2735ef9 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 21:35:52 -0300
+Subject: [PATCH 34/47] Movies: FPS box and F2 menu drawn over them (the movie
+ waits under the menu, its keys skip nothing); volume and media keys go to
+ DefWindowProc
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/nv2a_pb_d3d11.c | 57 ++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 51 insertions(+), 6 deletions(-)
+
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index d11b02e..983db6f 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -386,12 +386,16 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+         /* Auto-repeat (bit 30, the previous state) is not a new edge. */
+         if (!(l & (1L << 30)))
+             xbox_InputKeyEventWin32((int)w, (unsigned long)l, 1);
+-        /* System keys still go to Windows, or Alt+F4 stops closing us. */
+-        return m == WM_SYSKEYDOWN ? DefWindowProcA(h, m, w, l) : 0;
++        /* System keys still go to Windows, or Alt+F4 stops closing us; so
++         * do the volume and media keys (DefWindowProc turns them into the
++         * WM_APPCOMMAND the shell acts on and shows its volume box for). */
++        return m == WM_SYSKEYDOWN || (w >= VK_VOLUME_MUTE && w <= VK_LAUNCH_APP2)
++            ? DefWindowProcA(h, m, w, l) : 0;
+     case WM_KEYUP:
+     case WM_SYSKEYUP:
+         xbox_InputKeyEventWin32((int)w, (unsigned long)l, 0);
+-        return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
++        return m == WM_SYSKEYUP || (w >= VK_VOLUME_MUTE && w <= VK_LAUNCH_APP2)
++            ? DefWindowProcA(h, m, w, l) : 0;
+     /* Alt (the walk key) or F10 alone would put the window in menu mode,
+      * which takes the keyboard until the next key. There is no menu;
+      * Alt+F4 is SC_CLOSE and still reaches Windows. With the keyboard off
+@@ -6007,6 +6011,12 @@ static void movie_draw(ID3D11ShaderResourceView *srv, UINT w, UINT h)
+     vp.TopLeftY = ((float)s_back_h - vp.Height) * 0.5f;
+     vp.MinDepth = 0.0f;
+     vp.MaxDepth = 1.0f;
++#ifdef XBOXRECOMP_ENHANCE
++    s_ovl_place.x = (int32_t)vp.TopLeftX;
++    s_ovl_place.y = (int32_t)vp.TopLeftY;
++    s_ovl_place.w = (int32_t)vp.Width;
++    s_ovl_place.h = (int32_t)vp.Height;
++#endif
+     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back_rtv, NULL);
+     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
+     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+@@ -6025,6 +6035,25 @@ static void movie_draw(ID3D11ShaderResourceView *srv, UINT w, UINT h)
+     s_sc_init = 0;
+ }
+ 
++/* A movie frame (or black before the first) with what the game's frames
++ * carry over them, the FPS box and the F2 menu, presented. */
++static void movie_show(ID3D11ShaderResourceView *srv, UINT w, UINT h)
++{
++    if (srv)
++        movie_draw(srv, w, h);
++    else if (s_back && (s_back_rtv || SUCCEEDED(ID3D11Device_CreateRenderTargetView(
++                 s_dev, (ID3D11Resource *)s_back, NULL, &s_back_rtv)))) {
++        static const float black[4] = {0, 0, 0, 1};
++        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
++    }
++#ifdef XBOXRECOMP_ENHANCE
++    ovl_present();
++    nv2a_stats_add(NV2A_STAT_PRESENTS, 1);
++#endif
++    menu_present();
++    IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
++}
++
+ /* 1 when the movie played (to its end or a skip), 0 when it could not
+  * start: the title then plays its own. */
+ static int movie_run(const wchar_t *path)
+@@ -6032,7 +6061,7 @@ static int movie_run(const wchar_t *path)
+     ID3D11Texture2D *tex = NULL;
+     ID3D11ShaderResourceView *srv = NULL;
+     UINT tw = 0, th = 0, w, h;
+-    int frames = 0, armed = 0, done = 0;
++    int frames = 0, armed = 0, done = 0, held = 0;
+     ULONGLONG t0 = GetTickCount64();
+     movie_mf *m;
+ 
+@@ -6054,6 +6083,23 @@ static int movie_run(const wchar_t *path)
+             movie_mf_pause(m, 0);
+         }
+         present_resize();
++        if (xbox_MenuIsOpen()) {
++            /* F2 over a movie: the movie waits under the menu, and no key
++             * the menu uses (Esc, Enter, Space) skips it. */
++            if (!held)
++                movie_mf_pause(m, 1);
++            held = 1;
++            armed = 0;
++            t0 = GetTickCount64();
++            movie_show(srv, tw, th);
++            if (!s_sync_interval)
++                Sleep(15);
++            continue;
++        }
++        if (held) {
++            movie_mf_pause(m, 0);
++            held = 0;
++        }
+         if (!movie_skip_down())
+             armed = 1;               /* a key held from before is no skip */
+         else if (armed)
+@@ -6089,8 +6135,7 @@ static int movie_run(const wchar_t *path)
+         }
+         if (!movie_mf_copy(m, tex, w, h))
+             continue;
+-        movie_draw(srv, w, h);
+-        IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
++        movie_show(srv, w, h);
+         frames++;
+     }
+     movie_mf_close(m);
+-- 
+2.55.0.windows.3
+

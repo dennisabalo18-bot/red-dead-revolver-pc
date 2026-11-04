@@ -1,0 +1,214 @@
+From 9a830cbf9b5a62a97f53bbc0e04e067d64e035ed Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 06:08:15 -0300
+Subject: [PATCH 06/47] kernel: game speed (F8 toggles x2): vblank rate and
+ every guest clock
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/nv2a_pb_d3d11.c         |  7 +++++
+ src/kernel/kernel_hal.c         | 32 +++++++++++++++++++--
+ src/kernel/kernel_pacing.c      | 50 +++++++++++++++++++++++++++++++--
+ src/kernel/kernel_pacing.h      | 16 +++++++++++
+ src/kernel/xbox_memory_layout.c |  2 +-
+ 5 files changed, 101 insertions(+), 6 deletions(-)
+
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index cbc78b0..a7e653f 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -332,6 +332,13 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+             nv2a_pb_mlog_request();
+             return 0;
+         }
++        /* F8: game speed x2 on, off again (kernel_pacing.h). */
++        if (w == VK_F8) {
++            extern unsigned xbox_Speed(void);
++            extern void xbox_SpeedSet(unsigned speed);
++            xbox_SpeedSet(xbox_Speed() > 1 ? 1u : 2u);
++            return 0;
++        }
+     }
+ 
+     switch (m) {
+diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
+index 32a6a36..613c17a 100644
+--- a/src/kernel/kernel_hal.c
++++ b/src/kernel/kernel_hal.c
+@@ -1091,6 +1091,7 @@ LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void)
+ {
+     LARGE_INTEGER counter;
+     QueryPerformanceCounter(&counter);
++    counter.QuadPart = xbox_WarpCounts(counter.QuadPart);   /* game speed */
+     return counter;
+ }
+ 
+@@ -1154,7 +1155,7 @@ VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
+ 
+     InitOnceExecuteOnce(&s_time_once, anchor_system_time, NULL, NULL);
+     QueryPerformanceCounter(&now);
+-    delta = now.QuadPart - s_time_anchor_counts;
++    delta = xbox_WarpCounts(now.QuadPart) - s_time_anchor_counts;   /* game speed */
+     CurrentTime->QuadPart = s_time_anchor_100ns
+         + (delta / s_time_freq_counts) * 10000000LL
+         + (delta % s_time_freq_counts) * 10000000LL / s_time_freq_counts;
+@@ -1815,7 +1816,30 @@ ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
+      * scale by 10,000. Resolution is coarser than the real kernel's, but it is
+      * monotonic, which is the property callers actually depend on.
+      */
+-    return (ULONGLONG)GetTickCount64() * 10000ULL;
++    return (ULONGLONG)xbox_GuestTickMs() * 10000ULL;
++}
++
++/* GetTickCount64 as the guest's clock runs (game speed, kernel_pacing.h):
++ * the host's milliseconds at speed 1, faster from a speed change on. */
++uint64_t xbox_GuestTickMs(void)
++{
++    static LONGLONG freq, base_counts;
++    static uint64_t base_ms;
++    LARGE_INTEGER now;
++
++    if (!freq) {
++        LARGE_INTEGER f;
++        QueryPerformanceFrequency(&f);
++        QueryPerformanceCounter(&now);
++        base_counts = now.QuadPart;
++        base_ms = GetTickCount64();
++        freq = f.QuadPart ? f.QuadPart : 1;
++    }
++    QueryPerformanceCounter(&now);
++    {
++        LONGLONG d = xbox_WarpCounts(now.QuadPart) - base_counts;
++        return base_ms + (uint64_t)(d / freq) * 1000u + (uint64_t)(d % freq) * 1000u / (uint64_t)freq;
++    }
+ }
+ 
+ /* ============================================================================
+@@ -1852,7 +1876,9 @@ uint64_t xbox_ReadTimeStampCounter(void)
+     QueryPerformanceCounter(&now);
+ 
+     {
+-        uint64_t ticks = (uint64_t)(now.QuadPart - origin.QuadPart);
++        /* The origin is taken at boot, at speed 1, where the guest clock
++         * and the host's agree. */
++        uint64_t ticks = (uint64_t)(xbox_WarpCounts(now.QuadPart) - origin.QuadPart);
+         /* Split the scaling so a long run cannot overflow: whole seconds
+          * first, then the remainder. */
+         uint64_t secs = ticks / (uint64_t)freq.QuadPart;
+diff --git a/src/kernel/kernel_pacing.c b/src/kernel/kernel_pacing.c
+index 63df6fa..16bee65 100644
+--- a/src/kernel/kernel_pacing.c
++++ b/src/kernel/kernel_pacing.c
+@@ -32,11 +32,54 @@
+ 
+ /* ── The vblank schedule ─────────────────────────────────── */
+ 
++/* ── Game speed ──────────────────────────────────────────── */
++
++/* The guest clock is virt0 + (real - real0) * speed in performance-counter
++ * counts. A change writes the slot not in use and publishes it, so a reader
++ * never sees half of one; continuity at the switch comes from virt0 being
++ * the old mapping's value at real0. Changes come from a key press, far
++ * apart, so two slots are enough. */
++typedef struct { int64_t real0, virt0; unsigned speed; } SpeedWarp;
++static SpeedWarp s_warp[2] = { { 0, 0, 1 }, { 0, 0, 1 } };
++static SpeedWarp *s_warp_cur = &s_warp[0];
++static unsigned s_speed_gen;
++
++int64_t xbox_WarpCounts(int64_t real_counts)
++{
++    const SpeedWarp *w = __atomic_load_n(&s_warp_cur, __ATOMIC_ACQUIRE);
++    return w->virt0 + (real_counts - w->real0) * (int64_t)w->speed;
++}
++
++unsigned xbox_Speed(void)
++{
++    return __atomic_load_n(&s_warp_cur, __ATOMIC_ACQUIRE)->speed;
++}
++
++void xbox_SpeedSet(unsigned speed)
++{
++    SpeedWarp *o = __atomic_load_n(&s_warp_cur, __ATOMIC_ACQUIRE);
++    SpeedWarp *n = o == &s_warp[0] ? &s_warp[1] : &s_warp[0];
++    LARGE_INTEGER now;
++
++    if (speed < 1)
++        speed = 1;
++    if (speed == o->speed)
++        return;
++    QueryPerformanceCounter(&now);
++    n->virt0 = xbox_WarpCounts(now.QuadPart);
++    n->real0 = now.QuadPart;
++    n->speed = speed;
++    __atomic_store_n(&s_warp_cur, n, __ATOMIC_RELEASE);
++    __atomic_add_fetch(&s_speed_gen, 1u, __ATOMIC_RELEASE);
++}
++
++/* ── The vblank schedule ─────────────────────────────────── */
++
+ static uint64_t vblank_due(const XboxVblankSchedule *s, uint64_t n)
+ {
+     /* n * 1e9 overflows 64 bits only after ~9.7 years of vblanks; the
+      * 100 ms restart rule resets n long before a host runs that long. */
+-    return s->t0_ns + n * 1000000000ull / XBOX_VBLANK_HZ;
++    return s->t0_ns + n * 1000000000ull / (XBOX_VBLANK_HZ * (s->speed ? s->speed : 1u));
+ }
+ 
+ int xbox_VblankSchedule(XboxVblankSchedule *s, uint64_t now_ns,
+@@ -45,7 +88,10 @@ int xbox_VblankSchedule(XboxVblankSchedule *s, uint64_t now_ns,
+     uint64_t due;
+ 
+     *restarted_late_ns = 0;
+-    if (!s->started) {
++    if (!s->started || s->speed_gen != __atomic_load_n(&s_speed_gen, __ATOMIC_ACQUIRE)) {
++        /* A speed change starts a new grid at the new rate from now. */
++        s->speed_gen = __atomic_load_n(&s_speed_gen, __ATOMIC_ACQUIRE);
++        s->speed = xbox_Speed();
+         s->started = 1;
+         s->t0_ns = now_ns;
+         s->count = 0;
+diff --git a/src/kernel/kernel_pacing.h b/src/kernel/kernel_pacing.h
+index 1a3cf82..6594508 100644
+--- a/src/kernel/kernel_pacing.h
++++ b/src/kernel/kernel_pacing.h
+@@ -32,8 +32,24 @@ typedef struct {
+     int      started;
+     uint64_t t0_ns;      /* the grid's epoch */
+     uint64_t count;      /* vblanks fired since t0 */
++    unsigned speed;      /* xbox_Speed() the grid was started at (0 = 1) */
++    unsigned speed_gen;  /* ... and its change count: a change restarts it */
+ } XboxVblankSchedule;
+ 
++/* ── Game speed (rdr-port's fast-forward) ──
++ *
++ * xbox_SpeedSet(2) runs the guest twice as fast: vblanks come at 120 Hz and
++ * every clock the title reads (KeQueryPerformanceCounter, rdtsc,
++ * KeQuerySystemTime, KeQueryInterruptTime, KeTickCount) advances twice as
++ * fast from that moment on, without a jump. Waits with a timeout still run
++ * on the host's clock. 1 is stock. Any thread, any time. */
++void     xbox_SpeedSet(unsigned speed);
++unsigned xbox_Speed(void);
++/* A host performance-counter reading as the guest's clock sees it. */
++int64_t  xbox_WarpCounts(int64_t real_counts);
++/* GetTickCount64 on the guest's clock (kernel_hal.c). */
++uint64_t xbox_GuestTickMs(void);
++
+ #define XBOX_VBLANK_HZ          60u
+ #define XBOX_VBLANK_RESTART_NS  100000000ull   /* 100 ms behind: restart */
+ 
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 5c6e280..4fbb020 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -2602,7 +2602,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+          * hardware whether or not anyone is asleep. GetTickCount() shares the
+          * millisecond unit, so the rate matches. */
+         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+-                               + g_memory_offset) = GetTickCount();
++                               + g_memory_offset) = (uint32_t)xbox_GuestTickMs();
+ 
+         /* Sleep, don't yield. Sleep(0) is sched_yield on macOS and under
+          * Wine, and it returns at once when a core is free, so this loop
+-- 
+2.55.0.windows.3
+

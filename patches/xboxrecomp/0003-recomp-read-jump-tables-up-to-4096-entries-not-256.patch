@@ -1,0 +1,69 @@
+From 8d17c2abaf57990f6d35b811095b81bb5acbb8b9 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 02:14:25 -0300
+Subject: [PATCH 3/3] recomp: read jump tables up to 4096 entries, not 256
+
+Red Dead Revolver's script interpreter (sub_000FD0C0) switches over a
+575-entry table at 0x00100D5C. Capped at 256 the lifter emitted a
+73-target switch, and every case above 255 fell through to an indirect
+tail jump that resolves to nothing ("Failed to resolve VA 0x000FF234"),
+then a wild call and a crash on New Game. Tables are still cut at their
+real end by _leading_arms and by the next table's start.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/recomp/lifter.py     | 8 ++++++--
+ tools/recomp/translator.py | 4 ++--
+ 2 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index 775612f..452de00 100644
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -2682,7 +2682,11 @@ class Lifter:
+         """Check if a jump target is outside the current function."""
+         return not (self.func_start <= addr < self.func_end)
+ 
+-    def _read_jump_table(self, table_va, max_entries=256):
++    # rdr-port: 4096, not 256. Red Dead Revolver's sub_000FD0C0 switches over
++    # a 575-entry table (0x00100D5C); capped at 256, every case above 255
++    # fell through to an indirect tail jump that resolves to nothing. The
++    # table is still cut at its real end by _leading_arms.
++    def _read_jump_table(self, table_va, max_entries=4096):
+         """Read 32-bit jump table entries from the XBE at a given VA.
+         Returns list of target addresses. Stops when an entry is not a
+         valid code address or max_entries is reached."""
+@@ -2776,7 +2780,7 @@ class Lifter:
+             inside.append(target)
+         return inside
+ 
+-    def _read_jump_table_backward(self, last_va, max_entries=256):
++    def _read_jump_table_backward(self, last_va, max_entries=4096):
+         """Like _read_jump_table, reading downward from last_va."""
+         targets = []
+         for i in range(max_entries):
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index 7adc663..e70a7e5 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -1393,7 +1393,7 @@ class FunctionTranslator:
+         arms = {}
+         for start, end, table in sites:
+             following = bisect.bisect_right(tables, table)
+-            limit = table + 4 * 256
++            limit = table + 4 * 4096   # rdr-port: see lifter._read_jump_table
+             if following < len(tables):
+                 limit = min(limit, tables[following])
+             # MSVC places a switch table after the code it indexes.
+@@ -1737,7 +1737,7 @@ class FunctionTranslator:
+         return None
+ 
+     def _read_local_jump_table(self, table_va, lower, upper,
+-                               max_entries=256, min_entry_va=None):
++                               max_entries=4096, min_entry_va=None):
+         """Read the contiguous pointer cluster around an indexed-jump base."""
+         def scan(step, first):
+             targets = []
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,33 @@
+From 7890ca6ac53035c00a933e2b6eaa4545e73817d4 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 23:55:24 -0300
+Subject: [PATCH 35/47] Half-pixel 2D shift without hor+/snap_2d: scan the
+ frame's batches above scale 1 (not square targets)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/nv2a_pb_d3d11.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index 983db6f..11659ad 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -4104,7 +4104,13 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
+      * as float4 only when the gate is due to run it. With render.snap_2d
+      * above render scale 1 the 2D test runs without hor+ too: a 2D batch's
+      * stages sample at their 1x points (nv2a_snap_flat2d). */
+-    scan = rt->pad || nv2a_snap_2d_on(rt->n);
++    /* rdr-port: above scale 1 the test also runs on the frame without hor+
++     * or snap_2d, for set_vp's half-pixel shift of 2D edges: without it a
++     * 2D layer edge at x.5 (the book menu's frame) leaves the host column
++     * under it showing the scene. Not on a square target (a shadow or glow
++     * map, orthographic but 3D): shifted there it drew sliver lines. With
++     * no pad two_d only feeds that shift and snap_2d. */
++    scan = rt->pad || nv2a_snap_2d_on(rt->n) || (rt->n > 1 && rt->w != rt->h);
+     tris = rt->pad && topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+     if (tris && count > hxy_cap) {
+         float (*grown)[2] = (float (*)[2])realloc(hxy, (size_t)count * sizeof *hxy);
+-- 
+2.55.0.windows.3
+

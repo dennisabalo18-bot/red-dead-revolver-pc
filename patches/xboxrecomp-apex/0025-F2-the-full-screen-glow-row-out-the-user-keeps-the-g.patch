@@ -1,0 +1,36 @@
+From 0e16f9529a1239f95c244ddc33b61740d21916a1 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 14:41:38 -0300
+Subject: [PATCH 25/47] F2: the full-screen glow row out (the user keeps the
+ game's glow)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/host_menu.c | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/src/d3d/host_menu.c b/src/d3d/host_menu.c
+index 0a6561c..ec38f3f 100644
+--- a/src/d3d/host_menu.c
++++ b/src/d3d/host_menu.c
+@@ -154,9 +154,6 @@ static void set_snap(int i)
+     nv2a_host_opts_request(&o, NV2A_OPT_SNAP2D);
+ }
+ 
+-static const char *const k_glow[] = { "Sí (original)", "No (sin costura)", NULL };
+-static int get_glow(void) { return nv2a_d3d11_glow_off(-1) != 0; }
+-static void set_glow(int i) { nv2a_d3d11_glow_off(i); }
+ 
+ static int get_dump(void) { return nv2a_d3d11_tex_dump(); }
+ static void set_dump(int i) { nv2a_d3d11_tex_dump_set(i); }
+@@ -182,7 +179,6 @@ static const xbox_menu_item k_builtin[] = {
+     { "filter", "Filtro de escalado", k_filter, get_filter, set_filter },
+     { "aniso", "Filtrado anisotrópico", k_aniso, get_aniso, set_aniso },
+     { "snap_2d", "HUD alineado a píxel", k_snap, get_snap, set_snap },
+-    { "glow", "Brillo a pantalla completa", k_glow, get_glow, set_glow },
+     { "tex_dump", "Volcar texturas a carpeta", k_onoff, get_dump, set_dump },
+     { "vsync", "VSync (sincronía vertical)", k_onoff, get_vsync, set_vsync },
+     { "fps", "Mostrar FPS", k_onoff, get_fps, set_fps },
+-- 
+2.55.0.windows.3
+

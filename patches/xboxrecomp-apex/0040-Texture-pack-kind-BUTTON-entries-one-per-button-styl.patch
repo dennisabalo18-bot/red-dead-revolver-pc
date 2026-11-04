@@ -1,0 +1,143 @@
+From 48a9506311daefd202360fb6c7b548862c92242e Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 01:46:22 -0300
+Subject: [PATCH 40/47] Texture pack: kind BUTTON entries, one per button style
+ and F6 state, looked up first (nv2a_tex_pack_find_button), so F6 never
+ changes the buttons
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/nv2a_pb_d3d11.c    | 19 +++++++++++++++++--
+ src/kernel/nv2a_tex_pack.c | 38 +++++++++++++++++++++++++++++++++++++-
+ src/kernel/nv2a_tex_pack.h | 15 ++++++++++++++-
+ 3 files changed, 68 insertions(+), 4 deletions(-)
+
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index e5d2cc8..8e090fc 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -2215,8 +2215,23 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
+     uint32_t l;
+     int bc3 = 0;
+     if (nv2a_tex_pack_count()) {
+-        struct nv2a_tex_pack_entry *pe = nv2a_tex_pack_find(hash, t->width, t->height);
+-        if (pe && (src = nv2a_tex_pack_texels(pe)) != NULL) {
++        /* rdr-port: the buttons in the chosen style first (F2 "Botones en
++         * pantalla"), F6 or not: a font page by its hash or its indices. */
++        struct nv2a_tex_pack_entry *pe = nv2a_tex_pack_find_button(hash, t->width, t->height);
++        int by_idx = 0;
++        if (!pe && t->color == 0x0B && s_idx_hash
++                && (pe = nv2a_tex_pack_find_button(s_idx_hash, t->width, t->height)) != NULL)
++            by_idx = 1;
++        if (!pe || pe->bc3 || !nv2a_tex_pack_texels(pe)) {
++            pe = nv2a_tex_pack_find(hash, t->width, t->height);
++            by_idx = 0;
++        }
++        if (pe && by_idx && (src = nv2a_tex_pack_texels(pe)) != NULL) {
++            src = font_retint(pe, src, t);
++            width = pe->width;
++            height = pe->height;
++            levels = pe->levels;
++        } else if (pe && (src = nv2a_tex_pack_texels(pe)) != NULL) {
+             width = pe->width;
+             height = pe->height;
+             levels = pe->levels;
+diff --git a/src/kernel/nv2a_tex_pack.c b/src/kernel/nv2a_tex_pack.c
+index 2a691a4..15dc3dd 100644
+--- a/src/kernel/nv2a_tex_pack.c
++++ b/src/kernel/nv2a_tex_pack.c
+@@ -333,6 +333,26 @@ int nv2a_tex_pack_kind_enabled(uint32_t kind)
+         && (atomic_load_explicit(&s_mask, memory_order_relaxed) & (1u << kind)) != 0;
+ }
+ 
++static atomic_int s_btn_style = -1;
++
++void nv2a_tex_pack_set_button_style(int style)
++{
++    if (style < -1 || style > 2)
++        style = -1;
++    if (atomic_exchange_explicit(&s_btn_style, style, memory_order_relaxed) != style)
++        atomic_fetch_add_explicit(&s_gen, 1u, memory_order_relaxed);
++}
++
++int nv2a_tex_pack_button_style(void)
++{
++    return atomic_load_explicit(&s_btn_style, memory_order_relaxed);
++}
++
++uint64_t nv2a_tex_pack_button_key(uint64_t hash, int style, int art)
++{
++    return hash ^ (0x9E3779B97F4A7C15ull * (uint64_t)(1 + style * 2 + (art != 0)));
++}
++
+ uint32_t nv2a_tex_pack_gen(void)
+ {
+     return atomic_load_explicit(&s_gen, memory_order_relaxed);
+@@ -361,6 +381,22 @@ static struct nv2a_tex_pack_entry *lookup(uint64_t hash, uint32_t guest_w, uint3
+     return NULL;
+ }
+ 
++struct nv2a_tex_pack_entry *nv2a_tex_pack_find_button(uint64_t hash, uint32_t guest_w,
++                                                      uint32_t guest_h)
++{
++    unsigned m = atomic_load_explicit(&s_mask, memory_order_relaxed);
++    int style = atomic_load_explicit(&s_btn_style, memory_order_relaxed);
++    struct nv2a_tex_pack_entry *e;
++    if (!(m & PACK_ON) || style < 0)
++        return NULL;
++    e = lookup(nv2a_tex_pack_button_key(hash, style, (m >> XRTP_KIND_ART) & 1u),
++               guest_w, guest_h);
++    if (!e || e->kind != XRTP_KIND_BUTTON)
++        return NULL;
++    s_hits++;
++    return e;
++}
++
+ struct nv2a_tex_pack_entry *nv2a_tex_pack_find(uint64_t hash, uint32_t guest_w,
+                                                uint32_t guest_h)
+ {
+@@ -563,7 +599,7 @@ static const char *fmt_name(uint32_t color, char *buf, size_t len)
+ static const char *why_name(const struct nv2a_tex_pack_miss *m)
+ {
+     static const char *const kind_off[XRTP_KIND_COUNT] = {
+-        " (art off)", " (font off)", " (text off)",
++        " (art off)", " (font off)", " (text off)", " (button off)",
+     };
+     switch (m->why) {
+     case NV2A_TEX_PACK_MISS_PACK_OFF: return " (pack off)";
+diff --git a/src/kernel/nv2a_tex_pack.h b/src/kernel/nv2a_tex_pack.h
+index 59f4f49..b2487fa 100644
+--- a/src/kernel/nv2a_tex_pack.h
++++ b/src/kernel/nv2a_tex_pack.h
+@@ -52,7 +52,9 @@ extern "C" {
+ #define XRTP_KIND_ART   0u    /* HUD pieces and other images */
+ #define XRTP_KIND_FONT  1u    /* the font atlas the glyphs are drawn from */
+ #define XRTP_KIND_TEXT  2u    /* images of pre-rendered text */
+-#define XRTP_KIND_COUNT 3u
++#define XRTP_KIND_BUTTON 3u   /* rdr-port: controller buttons, one entry per style
++                               * (nv2a_tex_pack_find_button), apart from F6 */
++#define XRTP_KIND_COUNT 4u
+ #define XRTP_FLAG_BC3   0x10u /* payload is BC3 blocks, not A8R8G8B8 texels */
+ #define XRTP_FLAGS_KNOWN (XRTP_KIND_MASK | XRTP_FLAG_BC3)
+ 
+@@ -94,6 +96,17 @@ void nv2a_tex_pack_set_enabled(int on);
+ void nv2a_tex_pack_set_kind_enabled(uint32_t kind, int on);
+ int nv2a_tex_pack_kind_enabled(uint32_t kind);
+ uint32_t nv2a_tex_pack_gen(void);
++/* rdr-port: the on-screen buttons' style (0 keyboard, 1 Xbox, 2 PlayStation;
++ * -1 none). A kind BUTTON entry is keyed nv2a_tex_pack_button_key(hash,
++ * style, art): art is whether the improved textures (kind ART, F6) are on, so
++ * a font page with buttons has a 4x and a plain variant of each style. A
++ * change of style bumps nv2a_tex_pack_gen(). */
++void     nv2a_tex_pack_set_button_style(int style);
++int      nv2a_tex_pack_button_style(void);
++uint64_t nv2a_tex_pack_button_key(uint64_t hash, int style, int art);
++/* The kind BUTTON entry of (hash, aspect) for the style and F6 now, or NULL. */
++struct nv2a_tex_pack_entry *nv2a_tex_pack_find_button(uint64_t hash, uint32_t guest_w,
++                                                      uint32_t guest_h);
+ /* Hits of nv2a_tex_pack_find, for the backends' statistics. */
+ uint64_t nv2a_tex_pack_hits(void);
+ 
+-- 
+2.55.0.windows.3
+

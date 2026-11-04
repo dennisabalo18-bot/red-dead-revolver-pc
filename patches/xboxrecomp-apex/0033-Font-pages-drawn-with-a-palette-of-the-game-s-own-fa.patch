@@ -1,0 +1,109 @@
+From 9acecdda9398b35bbda2fa8076cca03296846ee5 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 16:05:53 -0300
+Subject: [PATCH 33/47] Font pages drawn with a palette of the game's own
+ (fades): found by their indices alone and tinted by the palette in use
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/nv2a_pb_d3d11.c | 69 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index b7c1af6..d11b02e 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -2149,6 +2149,57 @@ static void tex_dump(const Stage *t, uint64_t hash)
+     }
+ }
+ 
++static uint64_t s_idx_hash;
++static const uint8_t *s_idx_pal;
++
++/* rdr-port: a font page the game drew with a palette of its own (a text
++ * fading in or out changes the palette's alpha): the pack keys its pages by
++ * their indices alone too (texturas_pack.py letras_indices), and the
++ * redrawn page is tinted by the palette in use against the one it was made
++ * from (its most opaque texel stands for the palette's most opaque entry). */
++static const uint32_t *font_retint(const struct nv2a_tex_pack_entry *pe, const uint32_t *src,
++                                   const Stage *t)
++{
++    static uint32_t *buf;
++    static size_t cap;
++    const uint8_t *pal = s_idx_pal;
++    uint32_t ref = 0, cur = 0, n = pe->width * pe->height, i;
++    float f[4];
++    int c;
++
++    for (i = 0; i < n; i++)
++        if ((src[i] >> 24) > (ref >> 24))
++            ref = src[i];
++    for (i = 0; i < t->pal_len; i++) {
++        uint32_t v = (uint32_t)pal[i * 4] | (uint32_t)pal[i * 4 + 1] << 8
++                   | (uint32_t)pal[i * 4 + 2] << 16 | (uint32_t)pal[i * 4 + 3] << 24;
++        if ((v >> 24) > (cur >> 24))
++            cur = v;
++    }
++    if (!(ref >> 24) || ref == cur)
++        return src;
++    for (c = 0; c < 4; c++) {
++        uint32_t r = ref >> (c * 8) & 0xFF, k = cur >> (c * 8) & 0xFF;
++        f[c] = r ? (float)k / (float)r : 1.0f;
++    }
++    if (cap < pe->texels) {
++        uint32_t *grown = (uint32_t *)realloc(buf, pe->texels * 4u);
++        if (!grown)
++            return src;
++        buf = grown;
++        cap = pe->texels;
++    }
++    for (i = 0; i < pe->texels; i++) {
++        uint32_t v = src[i], o = 0;
++        for (c = 0; c < 4; c++) {
++            float x = (float)(v >> (c * 8) & 0xFF) * f[c];
++            o |= (uint32_t)(x > 255.0f ? 255.0f : x + 0.5f) << (c * 8);
++        }
++        buf[i] = o;
++    }
++    return buf;
++}
++
+ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
+ {
+     s_tc_gen++;
+@@ -2164,6 +2215,18 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
+             height = pe->height;
+             levels = pe->levels;
+             bc3 = pe->bc3;
++        } else if (t->color == 0x0B && s_idx_hash
++                   && (pe = nv2a_tex_pack_find(s_idx_hash, t->width, t->height)) != NULL
++                   && pe->kind == XRTP_KIND_FONT && !pe->bc3
++                   && (src = nv2a_tex_pack_texels(pe)) != NULL) {
++            static unsigned said;
++            if (said++ < 16)
++                fprintf(stderr, "[TEXPACK] font page by its indices %016llX (palette %016llX)\n",
++                        (unsigned long long)s_idx_hash, (unsigned long long)hash);
++            src = font_retint(pe, src, t);
++            width = pe->width;
++            height = pe->height;
++            levels = pe->levels;
+         } else {
+             nv2a_tex_pack_miss(hash, t->width, t->height, t->color, t->levels);
+         }
+@@ -2213,8 +2276,12 @@ static void tex_free(TexEntry *e)
+ static uint64_t tex_hash_pal(const uint8_t *mem, const Stage *t, uint32_t bytes)
+ {
+     uint64_t h = tex_hash(mem + t->offset, bytes);
+-    if (t->color == 0x0B)
++    s_idx_hash = 0;
++    if (t->color == 0x0B) {
++        s_idx_hash = h;
++        s_idx_pal = mem + t->palette;
+         h ^= tex_hash(mem + t->palette, t->pal_len * 4u) * 31u;
++    }
+     return h;
+ }
+ 
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,53 @@
+From 2a64333a4f84bf58d5f455483c9eee417fe66c8e Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 14:47:14 -0300
+Subject: [PATCH] Fast forward (Ctrl+F8, F2 speed row) only with
+ RDR_VELOCIDAD=1
+
+On a slow PC the game's controller thread crashed (XInputGetState on a
+handle full of 0xCC) right after x2/x4/x1: a tester's tool, out of the
+player's way.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/host_menu.c     | 6 +++++-
+ src/d3d/nv2a_pb_d3d11.c | 5 ++++-
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/d3d/host_menu.c b/src/d3d/host_menu.c
+index 99dcb98..cecc9af 100644
+--- a/src/d3d/host_menu.c
++++ b/src/d3d/host_menu.c
+@@ -177,8 +177,12 @@ static void builtin(void)
+     if (done)
+         return;
+     done = 1;
+-    for (i = 0; i < sizeof k_builtin / sizeof k_builtin[0]; i++)
++    for (i = 0; i < sizeof k_builtin / sizeof k_builtin[0]; i++) {
++        /* rdr-port: the speed row only for testers (RDR_VELOCIDAD=1, as Ctrl+F8). */
++        if (k_builtin[i].get == get_speed && !getenv("RDR_VELOCIDAD"))
++            continue;
+         s_items[s_n++] = &k_builtin[i];
++    }
+ }
+ 
+ void xbox_MenuAdd(const xbox_menu_item *it)
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index 8224806..11299d7 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -370,7 +370,10 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+         /* Ctrl+F8: game speed x1 -> x2 -> x4 -> x1 (kernel_pacing.h). F8 alone
+          * reached the window by itself (a hotkey of another program) and
+          * left the game running at x2 from the title screen. */
+-        if (w == VK_F8 && (GetKeyState(VK_CONTROL) & 0x8000)) {
++        /* Only with RDR_VELOCIDAD=1: on a slow PC the game's controller
++         * thread crashed right after x2/x4/x1, a tester's tool, not a
++         * player's. */
++        if (w == VK_F8 && (GetKeyState(VK_CONTROL) & 0x8000) && getenv("RDR_VELOCIDAD")) {
+             extern unsigned xbox_Speed(void);
+             extern void xbox_SpeedSet(unsigned speed);
+             xbox_SpeedSet(xbox_Speed() >= 4 ? 1u : xbox_Speed() > 1 ? 4u : 2u);
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,90 @@
+From eedb9c78ce371bcd0e3b151601d1bc52aeaadde8 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 06:02:14 -0300
+Subject: [PATCH 45/47] Focus from GetForegroundWindow every pump: no cursor
+ clip over another window, no pause left on after a lost WM_ACTIVATEAPP; first
+ flip asks to come to the front
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/nv2a_pb_d3d11.c | 15 +++++++++++++++
+ src/input/mouse.c       | 18 +++++++++++++++++-
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index 82082ff..f7d7448 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -453,6 +453,12 @@ static void pump(void)
+         DispatchMessageA(&msg);
+     }
+     xbox_InputMouseWin32Sync(s_hwnd);
++    /* rdr-port: in the background as Windows has it now. WM_ACTIVATEAPP
++     * alone could leave the game paused for good: the "back in front" one
++     * can go missing across a fullscreen switch made from the F2 menu, and
++     * the game then ignored every control but F2. */
++    if (s_hwnd)
++        s_unfocused = GetForegroundWindow() != s_hwnd;
+ }
+ 
+ static double sh_now_ms(void)
+@@ -5486,6 +5492,15 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
+ 
+     if (!init())
+         return;
++    {   /* rdr-port: the first frame asks to be in front (started from the
++         * launcher, Windows may leave a folder window on top); refused,
++         * the game waits paused, the cursor free, until it is clicked. */
++        static int asked;
++        if (!asked && s_hwnd) {
++            asked = 1;
++            SetForegroundWindow(s_hwnd);
++        }
++    }
+     pump();
+     /* rdr-port: paused in the background. The guest's clocks, vblanks and
+      * sound stop (xbox_PauseSet) and this flip waits, pumping the window,
+diff --git a/src/input/mouse.c b/src/input/mouse.c
+index dc97464..3e13313 100644
+--- a/src/input/mouse.c
++++ b/src/input/mouse.c
+@@ -542,6 +542,14 @@ static int clip_client(HWND h)
+ 
+     if (!s_applied || !GetClientRect(h, &r))
+         return 0;
++    /* rdr-port: never clip over another program's window: the game's may
++     * hold the focus inside its own thread without being in front (started
++     * from a launcher that closed, a folder window on top), and the cursor
++     * was then caged in a rectangle that window covered. */
++    if (GetForegroundWindow() != h) {
++        ClipCursor(NULL);
++        return 0;
++    }
+     if (r.right <= 0 || r.bottom <= 0)
+         return 1;
+     MapWindowPoints(h, NULL, (POINT *)&r, 2);
+@@ -798,12 +806,20 @@ static HWND sink_window(void)
+ void xbox_InputMouseWin32Sync(void *hwnd)
+ {
+     HWND h = (HWND)hwnd;
+-    int want = xbox_InputMouseCaptured();
++    int want, front;
+     RAWINPUTDEVICE rid;
+     POINT c;
+ 
+     if (!h)
+         return;
++    /* rdr-port: the focus as Windows has it now, not as the last focus
++     * message said. A message can go missing (a fullscreen switch, a window
++     * that never came to the front): the capture then stayed on over another
++     * program's window, or off with the game in front. */
++    front = GetForegroundWindow() == h;
++    if (front != LOAD(&s_focus) && !IsIconic(h))
++        xbox_InputMouseFocus(!front);
++    want = xbox_InputMouseCaptured() && front;
+     rid.usUsagePage = 0x01;              /* generic desktop */
+     rid.usUsage = 0x02;                  /* mouse */
+     if (want && !s_applied) {
+-- 
+2.55.0.windows.3
+

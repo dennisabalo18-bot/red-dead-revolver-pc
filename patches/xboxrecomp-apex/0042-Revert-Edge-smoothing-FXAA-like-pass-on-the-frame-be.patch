@@ -1,0 +1,221 @@
+From ee039a31cfe89f44ae01d6d3c1eb24b445e9a4f4 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 02:07:39 -0300
+Subject: [PATCH 42/47] Revert "Edge smoothing (FXAA-like) pass on the frame
+ before the present blit, F2 row 'Suavizado de bordes (FXAA)', RECOMP_FXAA"
+
+This reverts commit ca6e3d1a2aced30fe0d029a3d7ba7786a274a759.
+---
+ src/d3d/host_menu.c     |   3 -
+ src/d3d/host_menu.h     |   2 -
+ src/d3d/nv2a_pb_d3d11.c | 132 +---------------------------------------
+ 3 files changed, 1 insertion(+), 136 deletions(-)
+
+diff --git a/src/d3d/host_menu.c b/src/d3d/host_menu.c
+index 2b80fdc..333a03d 100644
+--- a/src/d3d/host_menu.c
++++ b/src/d3d/host_menu.c
+@@ -139,8 +139,6 @@ static void set_dump(int i) { nv2a_d3d11_tex_dump_set(i); }
+ 
+ static int get_vsync(void) { return nv2a_d3d11_vsync(-1); }
+ static void set_vsync(int i) { nv2a_d3d11_vsync(i); }
+-static int get_fxaa(void) { return nv2a_d3d11_fxaa(-1); }
+-static void set_fxaa(int i) { nv2a_d3d11_fxaa(i); }
+ static int s_fps_on;
+ static int get_fps(void) { return s_fps_on; }
+ static void set_fps(int i) { s_fps_on = i; }
+@@ -156,7 +154,6 @@ static const xbox_menu_item k_builtin[] = {
+     { "window", "Tamaño de ventana", k_window, get_window, set_window },
+     { "fullscreen", "Pantalla completa (F11)", k_onoff, get_full, set_full },
+     { "aniso", "Filtrado anisotrópico", k_aniso, get_aniso, set_aniso },
+-    { "fxaa", "Suavizado de bordes (FXAA)", k_onoff, get_fxaa, set_fxaa },
+     { "tex_dump", "Volcar texturas a carpeta", k_onoff, get_dump, set_dump },
+     { "vsync", "VSync (sincronía vertical)", k_onoff, get_vsync, set_vsync },
+     { "fps", "Mostrar FPS", k_onoff, get_fps, set_fps },
+diff --git a/src/d3d/host_menu.h b/src/d3d/host_menu.h
+index 1619859..56ae491 100644
+--- a/src/d3d/host_menu.h
++++ b/src/d3d/host_menu.h
+@@ -58,8 +58,6 @@ int  nv2a_d3d11_tex_dump(void);
+  * the present waits for the display. 0/1 set, -1 only reads. */
+ int  nv2a_d3d11_pause_focus(int set);
+ int  nv2a_d3d11_vsync(int set);
+-/* nv2a_pb_d3d11.c: edge smoothing (FXAA-like) on the frame, 1/0; -1 only reads. */
+-int  nv2a_d3d11_fxaa(int set);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index 8e090fc..af527fa 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -4628,53 +4628,6 @@ static const char s_blit_ps_src[] =
+     "                                      + dy * ((j + 0.5) / 4.0 - 0.5), 0).rgb;\n"
+     "    return float4(c / 16.0, 1);\n"
+     "}\n";
+-/* rdr-port: edge smoothing (F2 "Suavizado de bordes"), a pass over the
+- * whole frame at its own size before the present blit: where the luma
+- * changes across an edge, blend along the edge's direction (the usual
+- * fast approximate method, FXAA-like). The HUD is in the same frame, so its
+- * letters get a touch of it too; off by default. */
+-static const char s_aa_ps_src[] =
+-    "Texture2D t0 : register(t0); SamplerState s0 : register(s0);\n"
+-    "float L(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
+-    "float3 S(float2 t) { return t0.SampleLevel(s0, t, 0).rgb; }\n"
+-    "float4 main(float4 p : SV_Position, float2 t : TEXCOORD0) : SV_Target {\n"
+-    "    uint w, h;\n"
+-    "    t0.GetDimensions(w, h);\n"
+-    "    float2 px = 1.0 / float2(w, h);\n"
+-    "    float3 cM = S(t);\n"
+-    "    float lNW = L(S(t + float2(-1, -1) * px)), lNE = L(S(t + float2(1, -1) * px));\n"
+-    "    float lSW = L(S(t + float2(-1, 1) * px)), lSE = L(S(t + float2(1, 1) * px));\n"
+-    "    float lM = L(cM);\n"
+-    "    float lo = min(lM, min(min(lNW, lNE), min(lSW, lSE)));\n"
+-    "    float hi = max(lM, max(max(lNW, lNE), max(lSW, lSE)));\n"
+-    "    if (hi - lo < max(0.04, hi * 0.15)) return float4(cM, 1);\n"
+-    "    float2 d = float2((lSW + lSE) - (lNW + lNE), (lNW + lSW) - (lNE + lSE));\n"
+-    "    float red = max((lNW + lNE + lSW + lSE) * 0.03125, 1.0 / 128.0);\n"
+-    "    d = clamp(d / (min(abs(d.x), abs(d.y)) + red), -8.0, 8.0) * px;\n"
+-    "    float3 a = 0.5 * (S(t + d * (1.0 / 3.0 - 0.5)) + S(t + d * (2.0 / 3.0 - 0.5)));\n"
+-    "    float3 b = a * 0.5 + 0.25 * (S(t - d * 0.5) + S(t + d * 0.5));\n"
+-    "    float lb = L(b);\n"
+-    "    return float4((lb < lo || lb > hi) ? a : b, 1);\n"
+-    "}\n";
+-static int                       s_aa_on = -1;  /* -1: RECOMP_FXAA not read yet */
+-static ID3D11PixelShader        *s_aa_ps;
+-static ID3D11Texture2D          *s_aa_tex;
+-static ID3D11RenderTargetView   *s_aa_rtv;
+-static ID3D11ShaderResourceView *s_aa_srv;
+-static UINT                      s_aa_w, s_aa_h;
+-static int                       s_aa_failed;
+-
+-int nv2a_d3d11_fxaa(int set)
+-{
+-    if (s_aa_on < 0) {
+-        const char *e = getenv("RECOMP_FXAA");
+-        s_aa_on = e && *e == '1';
+-    }
+-    if (set >= 0)
+-        s_aa_on = set != 0;
+-    return s_aa_on;
+-}
+-
+ static ID3D11VertexShader *s_blit_vs;
+ static ID3D11PixelShader  *s_blit_ps;
+ static ID3D11SamplerState *s_blit_smp[2];   /* point, linear */
+@@ -4939,87 +4892,6 @@ static void menu_present(void)
+ #ifdef XBOXRECOMP_ENHANCE
+ static struct nv2a_rect s_ovl_place;    /* the overlay's: the frame in the back buffer */
+ #endif
+-/* The edge-smoothing pass: rt's whole texture into s_aa_tex, same size;
+- * returns the view the present blit reads (rt's own when off or failed). */
+-static ID3D11ShaderResourceView *aa_pass(RenderTarget *rt)
+-{
+-    ID3D11ShaderResourceView *none = NULL;
+-    D3D11_VIEWPORT vp;
+-
+-    if (!nv2a_d3d11_fxaa(-1) || s_aa_failed)
+-        return rt->srv;
+-    if (!s_aa_ps) {
+-        ID3DBlob *code = NULL;
+-        s_aa_failed = 1;
+-        if (!compile("rdr_fxaa_ps", s_aa_ps_src, "ps_5_0", &code))
+-            return rt->srv;
+-        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+-                                       ID3D10Blob_GetBufferSize(code), NULL, &s_aa_ps);
+-        ID3D10Blob_Release(code);
+-        if (!s_aa_ps)
+-            return rt->srv;
+-        s_aa_failed = 0;
+-    }
+-    if (!s_aa_tex || s_aa_w != rt->hw || s_aa_h != rt->hh) {
+-        D3D11_TEXTURE2D_DESC td;
+-        if (s_aa_srv) ID3D11ShaderResourceView_Release(s_aa_srv);
+-        if (s_aa_rtv) ID3D11RenderTargetView_Release(s_aa_rtv);
+-        if (s_aa_tex) ID3D11Texture2D_Release(s_aa_tex);
+-        s_aa_srv = NULL;
+-        s_aa_rtv = NULL;
+-        s_aa_tex = NULL;
+-        s_aa_w = s_aa_h = 0;
+-        memset(&td, 0, sizeof td);
+-        td.Width = rt->hw;
+-        td.Height = rt->hh;
+-        td.MipLevels = 1;
+-        td.ArraySize = 1;
+-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+-        td.SampleDesc.Count = 1;
+-        td.Usage = D3D11_USAGE_DEFAULT;
+-        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+-        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_aa_tex))
+-                || FAILED(ID3D11Device_CreateRenderTargetView(
+-                       s_dev, (ID3D11Resource *)s_aa_tex, NULL, &s_aa_rtv))
+-                || FAILED(ID3D11Device_CreateShaderResourceView(
+-                       s_dev, (ID3D11Resource *)s_aa_tex, NULL, &s_aa_srv)))
+-            return rt->srv;
+-        s_aa_w = rt->hw;
+-        s_aa_h = rt->hh;
+-    }
+-    {
+-        D3D11_MAPPED_SUBRESOURCE m;
+-        float uv[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+-        if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
+-                                           D3D11_MAP_WRITE_DISCARD, 0, &m)))
+-            return rt->srv;
+-        memcpy(m.pData, uv, sizeof uv);
+-        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_blit_cb, 0);
+-    }
+-    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_aa_rtv, NULL);
+-    vp.TopLeftX = vp.TopLeftY = 0.0f;
+-    vp.Width = (float)rt->hw;
+-    vp.Height = (float)rt->hh;
+-    vp.MinDepth = 0.0f;
+-    vp.MaxDepth = 1.0f;
+-    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+-    ID3D11DeviceContext_RSSetState(s_ctx, s_rs[0][0]);
+-    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFF);
+-    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_off, 0);
+-    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+-    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+-    ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
+-    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_blit_cb);
+-    ID3D11DeviceContext_PSSetShader(s_ctx, s_aa_ps, NULL, 0);
+-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &rt->srv);
+-    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp[1]);
+-    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+-    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+-    s_sc_init = 0;
+-    return s_aa_srv;
+-}
+-
+ static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int internal)
+ {
+     static const float black[4] = {0, 0, 0, 1};
+@@ -5029,7 +4901,6 @@ static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int in
+     UINT cw, ch, hcw, hch;
+     struct nv2a_crop c;
+     int whole;
+-    ID3D11ShaderResourceView *src;
+ 
+     if (!s_back || !blit_init())
+         return;
+@@ -5039,7 +4910,6 @@ static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int in
+     if (!rt->srv && FAILED(ID3D11Device_CreateShaderResourceView(
+                 s_dev, (ID3D11Resource *)rt->tex, NULL, &rt->srv)))
+         return;
+-    src = aa_pass(rt);
+     present_extent(rt, &cw, &ch);
+     /* hor+: the pads go to the screen with the frame (Metal's present) */
+     hcw = (cw + 2u * rt->pad) * rt->n;
+@@ -5084,7 +4954,7 @@ static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int in
+     ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
+     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_blit_cb);
+     ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps, NULL, 0);
+-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &src);
++    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &rt->srv);
+     /* Point for nearest and whole multiples; linear for linear and for an
+      * integer frame that had to shrink to fit. */
+     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1,
+-- 
+2.55.0.windows.3
+

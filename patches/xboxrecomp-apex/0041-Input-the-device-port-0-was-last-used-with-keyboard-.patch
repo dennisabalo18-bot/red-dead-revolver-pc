@@ -1,0 +1,89 @@
+From 43fe062f557c8eca4526485c292998768b8bdf8a Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 01:55:31 -0300
+Subject: [PATCH 41/47] Input: the device port 0 was last used with (keyboard,
+ Xbox-like pad, PlayStation pad), for the buttons' automatic style
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/input/host_pad.h   |  5 +++++
+ src/input/input_core.c | 33 +++++++++++++++++++++++++++++++++
+ 2 files changed, 38 insertions(+)
+
+diff --git a/src/input/host_pad.h b/src/input/host_pad.h
+index 3526948..df437cf 100644
+--- a/src/input/host_pad.h
++++ b/src/input/host_pad.h
+@@ -95,6 +95,11 @@ enum {
+     XBOX_PAD_FAMILY_AUTO = -1
+ };
+ int  xbox_InputPadFamily(DWORD slot);
++/* rdr-port: the device port 0 was last used with: -1 none yet, 0 keyboard and
++ * mouse, 1 an Xbox (or other) pad, 2 a PlayStation pad (input_core.c).
++ * NoteDevice tells it of input it does not see (mouse motion). */
++int  xbox_InputLastDevice(void);
++void xbox_InputNoteDevice(int dev);
+ void xbox_InputSetGlyphFamily(int family);
+ const char *xbox_InputPadFamilyName(int family);
+ int  xbox_InputPadFamilyFromName(const char *name);   /* "auto" -> AUTO; -2 unknown */
+diff --git a/src/input/input_core.c b/src/input/input_core.c
+index cac6364..2590af0 100644
+--- a/src/input/input_core.c
++++ b/src/input/input_core.c
+@@ -415,6 +415,35 @@ static DWORD filtered(DWORD port, DWORD rc, XBOX_INPUT_STATE *st,
+ #define FILTER(port, rc, st) (rc)
+ #endif
+ 
++/* rdr-port: what port 0 was last used with, for the on-screen buttons'
++ * automatic style: -1 nothing yet, 0 keyboard and mouse, 1 an Xbox (or
++ * other) pad, 2 a PlayStation pad. A press, a trigger or a stick pushed well
++ * off centre counts; a resting stick does not. */
++static int g_last_dev = -1;
++
++static int pad_busy(const XBOX_GAMEPAD *g)
++{
++    int i;
++    if (g->wButtons)
++        return 1;
++    for (i = 0; i < 8; i++)
++        if (g->bAnalogButtons[i] > 40)
++            return 1;
++    return g->sThumbLX > 16000 || g->sThumbLX < -16000 || g->sThumbLY > 16000
++        || g->sThumbLY < -16000 || g->sThumbRX > 16000 || g->sThumbRX < -16000
++        || g->sThumbRY > 16000 || g->sThumbRY < -16000;
++}
++
++int xbox_InputLastDevice(void)
++{
++    return __atomic_load_n(&g_last_dev, __ATOMIC_ACQUIRE);
++}
++
++void xbox_InputNoteDevice(int dev)
++{
++    __atomic_store_n(&g_last_dev, dev, __ATOMIC_RELEASE);
++}
++
+ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+ {
+     XBOX_INPUT_STATE kb;
+@@ -428,6 +457,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
+         return ERROR_DEVICE_NOT_CONNECTED;
+     rc = pad_state(dwPort, pState, &raw);
++    if (dwPort == 0 && rc == ERROR_SUCCESS && pad_busy(&pState->Gamepad))
++        xbox_InputNoteDevice(xbox_InputPadFamily(0) == XBOX_PAD_FAMILY_PLAYSTATION ? 2 : 1);
+ #ifdef XBOXRECOMP_ENHANCE
+     /* The host pad before the keyboard and the script are merged: a chord is
+      * the pad's, a key the keyboard's (the filter reads keys itself). */
+@@ -447,6 +478,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+     /* The keyboard answers for port 0 with or without a pad there, and is
+      * merged on top of one: a real pad keeps working, the keys only add. */
+     if (dwPort == 0 && g_be->keyboard && g_be->keyboard(&kb)) {
++        if (pad_busy(&kb.Gamepad))
++            xbox_InputNoteDevice(0);
+         if (rc != ERROR_SUCCESS) {
+             *pState = kb;
+             return KEEP(dwPort, FILTER(dwPort, ERROR_SUCCESS, pState), pState);
+-- 
+2.55.0.windows.3
+

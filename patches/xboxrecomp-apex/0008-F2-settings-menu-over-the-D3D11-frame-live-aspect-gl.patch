@@ -1,0 +1,939 @@
+From 737443aae25dbd489576b59fbfd927b099122996 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 06:59:44 -0300
+Subject: [PATCH 08/47] F2 settings menu over the D3D11 frame; live aspect;
+ glow skip by frame copy
+
+- d3d/host_menu.c: GDI-drawn panel blended before the present, rows of
+  choices (render scale, aspect, window size, fullscreen, filter, aniso,
+  snap_2d, glow, speed) plus a title's own via xbox_MenuAdd; saved to and
+  loaded from a key=choice file. Takes keys and mouse buttons while open.
+- NV2A_OPT_ASPECT: display.aspect changes live; the D3D11 backend drops its
+  targets as for a scale change.
+- nv2a_d3d11_window_request: client size set at the flip.
+- skip_rt_overlay now skips only a copy of a target laid back over that
+  same target (rt_copy_mark), so 512x256 menu targets keep drawing;
+  RECOMP_D3D11_SKIP_RT=1 for any size, nv2a_d3d11_glow_off live.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/CMakeLists.txt           |   1 +
+ src/d3d/host_menu.c              | 457 +++++++++++++++++++++++++++++++
+ src/d3d/host_menu.h              |  54 ++++
+ src/d3d/nv2a_pb_d3d11.c          | 248 +++++++++++++++--
+ src/kernel/nv2a_backend_common.c |  15 +
+ src/kernel/nv2a_backend_common.h |   3 +
+ 6 files changed, 761 insertions(+), 17 deletions(-)
+ create mode 100644 src/d3d/host_menu.c
+ create mode 100644 src/d3d/host_menu.h
+
+diff --git a/src/d3d/CMakeLists.txt b/src/d3d/CMakeLists.txt
+index a38b511..be5395b 100644
+--- a/src/d3d/CMakeLists.txt
++++ b/src/d3d/CMakeLists.txt
+@@ -22,6 +22,7 @@ if(WIN32)
+         d3d8_vsh_msl.c
+         d3d8_combiners_msl.c
+         nv2a_pb_d3d11.c
++        host_menu.c
+         shader_cache.c
+     )
+     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
+diff --git a/src/d3d/host_menu.c b/src/d3d/host_menu.c
+new file mode 100644
+index 0000000..1a490eb
+--- /dev/null
++++ b/src/d3d/host_menu.c
+@@ -0,0 +1,457 @@
++/*
++ * host_menu.c - the F2 settings menu; see host_menu.h.
++ *
++ * The panel is drawn with GDI into a top-down DIB, only when what it shows
++ * moved (a signature of the selection, every row's choice and the size), and
++ * nv2a_pb_d3d11.c uploads it and blends it over the back buffer before the
++ * present. Keys and the draw both run on the window's thread (the flip pumps
++ * the window), so the menu's own state needs no lock; a row's get and set
++ * only touch values other threads read whole.
++ */
++#include "host_menu.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <windows.h>
++
++#include "nv2a_backend_common.h"
++#include "kernel_pacing.h"
++#include "input/keyboard.h"
++#include "input/mouse.h"
++
++#define ITEMS_MAX 64
++
++static const xbox_menu_item *s_items[ITEMS_MAX];
++static int  s_n, s_sel = -1, s_open, s_loading;
++static char s_path[MAX_PATH];
++
++/* ---- the runtime's rows ------------------------------------------------- */
++
++static const char *const k_scale[] = {
++    "x1 (640x480)", "x2 (1280x960)", "x3 (1920x1440)", "x4 (2560x1920)", NULL
++};
++static int get_scale(void) { return (int)nv2a_host_render_scale() - 1; }
++static void set_scale(int i)
++{
++    struct nv2a_host_opts o = *nv2a_host_opts();
++    o.render_scale = (unsigned)i + 1u;
++    nv2a_host_opts_request(&o, NV2A_OPT_SCALE);
++}
++
++static const char *const k_aspect[] = { "4:3 (original)", "16:9", "16:10", "21:9", NULL };
++static const unsigned k_aspect_wh[][2] = { {0, 0}, {16, 9}, {16, 10}, {21, 9} };
++static int get_aspect(void)
++{
++    const struct nv2a_host_opts *o = nv2a_host_opts();
++    int i;
++    for (i = 1; i < 4; i++)
++        if (o->aspect_w * k_aspect_wh[i][1] == o->aspect_h * k_aspect_wh[i][0] && o->aspect_w)
++            return i;
++    return 0;
++}
++static void set_aspect(int i)
++{
++    struct nv2a_host_opts o = *nv2a_host_opts();
++    o.aspect_w = k_aspect_wh[i][0];
++    o.aspect_h = k_aspect_wh[i][1];
++    nv2a_host_opts_request(&o, NV2A_OPT_ASPECT);
++}
++
++static const char *const k_window[] = {
++    "Libre", "640x480", "800x600", "960x720", "1024x768", "1280x720", "1280x960",
++    "1366x768", "1440x1080", "1600x900", "1600x1200", "1920x1080", "2560x1080",
++    "2560x1440", "3840x2160", NULL
++};
++static int s_window;
++static void set_full(int i);
++static int get_window(void) { return s_window; }
++static void set_window(int i)
++{
++    unsigned w, h;
++    s_window = i;
++    if (i <= 0 || sscanf(k_window[i], "%ux%u", &w, &h) != 2)
++        return;
++    nv2a_d3d11_window_request(w, h);
++    /* Picked in the menu while fullscreen: back to the window to show it. */
++    if (!s_loading && nv2a_host_opts()->fullscreen)
++        set_full(0);
++}
++
++static const char *const k_onoff[] = { "No", "Sí", NULL };
++static int get_full(void) { return nv2a_host_opts()->fullscreen != 0; }
++static void set_full(int i)
++{
++    struct nv2a_host_opts o = *nv2a_host_opts();
++    o.fullscreen = i;
++    nv2a_host_opts_request(&o, NV2A_OPT_FULLSCREEN);
++}
++
++static const char *const k_filter[] = { "Nítido", "Suave", "Entero", NULL };
++static int get_filter(void)
++{
++    int f = nv2a_host_opts()->present_filter;
++    return f >= 0 && f <= 2 ? f : 0;
++}
++static void set_filter(int i)
++{
++    struct nv2a_host_opts o = *nv2a_host_opts();
++    o.present_filter = i;
++    nv2a_host_opts_request(&o, NV2A_OPT_FILTER);
++}
++
++static const char *const k_aniso[] = { "No", "x2", "x4", "x8", "x16", NULL };
++static const unsigned k_aniso_v[] = { 0, 2, 4, 8, 16 };
++static int get_aniso(void)
++{
++    unsigned a = nv2a_host_opts()->aniso;
++    int i;
++    for (i = 4; i > 0; i--)
++        if (a >= k_aniso_v[i])
++            return i;
++    return 0;
++}
++static void set_aniso(int i)
++{
++    struct nv2a_host_opts o = *nv2a_host_opts();
++    o.aniso = k_aniso_v[i];
++    nv2a_host_opts_request(&o, NV2A_OPT_ANISO);
++}
++
++static const char *const k_snap[] = { "No", "Sí", NULL };
++static int get_snap(void) { return nv2a_host_opts()->snap_2d != 0; }
++static void set_snap(int i)
++{
++    struct nv2a_host_opts o = *nv2a_host_opts();
++    o.snap_2d = i;
++    nv2a_host_opts_request(&o, NV2A_OPT_SNAP2D);
++}
++
++static const char *const k_glow[] = { "Sí (original)", "No (sin costura)", NULL };
++static int get_glow(void) { return nv2a_d3d11_glow_off(-1) != 0; }
++static void set_glow(int i) { nv2a_d3d11_glow_off(i); }
++
++static const char *const k_speed[] = { "x1", "x2 (F8)", NULL };
++static int get_speed(void) { return xbox_Speed() > 1; }
++static void set_speed(int i) { xbox_SpeedSet(i ? 2u : 1u); }
++
++static const xbox_menu_item k_builtin[] = {
++    { NULL, "Gráficos", NULL, NULL, NULL },
++    { "render_scale", "Resolución interna", k_scale, get_scale, set_scale },
++    { "aspect", "Relación de aspecto", k_aspect, get_aspect, set_aspect },
++    { "window", "Tamaño de ventana", k_window, get_window, set_window },
++    { "fullscreen", "Pantalla completa (F11)", k_onoff, get_full, set_full },
++    { "filter", "Filtro de escalado", k_filter, get_filter, set_filter },
++    { "aniso", "Filtrado anisotrópico", k_aniso, get_aniso, set_aniso },
++    { "snap_2d", "HUD alineado a píxel", k_snap, get_snap, set_snap },
++    { "glow", "Brillo a pantalla completa", k_glow, get_glow, set_glow },
++    { NULL, "Juego", NULL, NULL, NULL },
++    { NULL, "Velocidad", k_speed, get_speed, set_speed },
++};
++
++static void builtin(void)
++{
++    static int done;
++    size_t i;
++    if (done)
++        return;
++    done = 1;
++    for (i = 0; i < sizeof k_builtin / sizeof k_builtin[0]; i++)
++        s_items[s_n++] = &k_builtin[i];
++}
++
++void xbox_MenuAdd(const xbox_menu_item *it)
++{
++    builtin();
++    if (it && s_n < ITEMS_MAX)
++        s_items[s_n++] = it;
++}
++
++static int choice_count(const xbox_menu_item *it)
++{
++    int n = 0;
++    while (it->choices && it->choices[n])
++        n++;
++    return n;
++}
++
++static void save(void)
++{
++    FILE *f;
++    int i;
++    if (!s_path[0] || s_loading || !(f = fopen(s_path, "w")))
++        return;
++    fprintf(f, "# Ajustes del menú F2 (se reescribe solo). Borra el archivo para volver a env.bat.\n");
++    for (i = 0; i < s_n; i++) {
++        const xbox_menu_item *it = s_items[i];
++        int c;
++        if (!it->key || !it->choices)
++            continue;
++        c = it->get();
++        if (c >= 0 && c < choice_count(it))
++            fprintf(f, "%s=%s\n", it->key, it->choices[c]);
++    }
++    fclose(f);
++}
++
++void xbox_MenuLoad(const char *path)
++{
++    char line[256];
++    FILE *f;
++
++    builtin();
++    snprintf(s_path, sizeof s_path, "%s", path ? path : "");
++    if (!s_path[0] || !(f = fopen(s_path, "r")))
++        return;
++    s_loading = 1;
++    while (fgets(line, sizeof line, f)) {
++        char *eq = strchr(line, '='), *v;
++        int i, c;
++        if (line[0] == '#' || !eq)
++            continue;
++        *eq = 0;
++        v = eq + 1;
++        v[strcspn(v, "\r\n")] = 0;
++        for (i = 0; i < s_n; i++) {
++            const xbox_menu_item *it = s_items[i];
++            if (!it->key || !it->choices || strcmp(it->key, line))
++                continue;
++            for (c = 0; it->choices[c]; c++)
++                if (!strcmp(it->choices[c], v)) {
++                    it->set(c);
++                    break;
++                }
++        }
++    }
++    s_loading = 0;
++    fclose(f);
++    fprintf(stderr, "[MENU] settings from %s\n", s_path);
++}
++
++int xbox_MenuIsOpen(void)
++{
++    return s_open;
++}
++
++/* ---- keys ----------------------------------------------------------------- */
++
++static void move_sel(int d)
++{
++    int i, k = s_sel;
++    for (i = 0; i < s_n; i++) {
++        k = (k + d + s_n) % s_n;
++        if (s_items[k]->choices) {
++            s_sel = k;
++            return;
++        }
++    }
++}
++
++static void change(int d)
++{
++    const xbox_menu_item *it;
++    int n, c;
++    if (s_sel < 0 || s_sel >= s_n || !(it = s_items[s_sel])->choices)
++        return;
++    n = choice_count(it);
++    if (n <= 0)
++        return;
++    c = it->get();
++    if (c < 0 || c >= n)
++        c = 0;
++    c = (c + d + n) % n;
++    it->set(c);
++    save();
++}
++
++static void open_menu(int on)
++{
++    builtin();
++    s_open = on;
++    if (on && s_sel < 0)
++        move_sel(1);
++    /* Nothing held into the menu or out of it; the cursor is free while
++     * it is up, so the mouse turns nothing. */
++    xbox_InputKeysClear();
++    xbox_InputMouseSuspend(on);
++}
++
++int xbox_MenuKey(int vk, int down, int repeat)
++{
++    if (!s_open) {
++        if (vk == VK_F2 && down && !repeat) {
++            open_menu(1);
++            return 1;
++        }
++        return 0;
++    }
++    /* The host's own keys still work with the menu up. */
++    if (vk == VK_F8 || vk == VK_F10 || vk == VK_F11)
++        return 0;
++    if (!down)
++        return 1;
++    switch (vk) {
++    case VK_F2:
++    case VK_ESCAPE:
++        if (!repeat)
++            open_menu(0);
++        break;
++    case VK_UP:    move_sel(-1); break;
++    case VK_DOWN:  move_sel(1); break;
++    case VK_LEFT:  change(-1); break;
++    case VK_RIGHT:
++    case VK_RETURN:
++    case VK_SPACE: change(1); break;
++    }
++    return 1;
++}
++
++/* ---- the panel ------------------------------------------------------------ */
++
++static HDC      s_dc;
++static HBITMAP  s_bmp;
++static uint32_t *s_px;
++static unsigned s_w, s_h, s_gen;
++static HFONT    s_font, s_font_big, s_font_small;
++static unsigned s_font_px, s_sig;
++
++static void text(int x, int y, int w, int h, const char *utf8, UINT fmt, COLORREF col)
++{
++    wchar_t wb[160];
++    RECT r;
++    if (!MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wb, 160))
++        return;
++    r.left = x;
++    r.top = y;
++    r.right = x + w;
++    r.bottom = y + h;
++    SetTextColor(s_dc, col);
++    DrawTextW(s_dc, wb, -1, &r, fmt | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
++}
++
++static void fill(int x, int y, int w, int h, COLORREF col)
++{
++    RECT r;
++    HBRUSH b = CreateSolidBrush(col);
++    r.left = x;
++    r.top = y;
++    r.right = x + w;
++    r.bottom = y + h;
++    FillRect(s_dc, &r, b);
++    DeleteObject(b);
++}
++
++static HFONT font(int px, int weight)
++{
++    return CreateFontW(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
++                       CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
++}
++
++static int make_surface(unsigned w, unsigned h, unsigned fpx)
++{
++    BITMAPINFO bi;
++    void *bits = NULL;
++
++    if (!s_dc && !(s_dc = CreateCompatibleDC(NULL)))
++        return 0;
++    if (fpx != s_font_px) {
++        if (s_font) DeleteObject(s_font);
++        if (s_font_big) DeleteObject(s_font_big);
++        if (s_font_small) DeleteObject(s_font_small);
++        s_font = font((int)fpx, FW_NORMAL);
++        s_font_big = font((int)(fpx * 13 / 10), FW_BOLD);
++        s_font_small = font((int)(fpx * 8 / 10), FW_SEMIBOLD);
++        s_font_px = fpx;
++    }
++    if (s_bmp && w == s_w && h == s_h)
++        return 1;
++    if (s_bmp)
++        DeleteObject(s_bmp);
++    memset(&bi, 0, sizeof bi);
++    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
++    bi.bmiHeader.biWidth = (LONG)w;
++    bi.bmiHeader.biHeight = -(LONG)h;      /* top-down */
++    bi.bmiHeader.biPlanes = 1;
++    bi.bmiHeader.biBitCount = 32;
++    bi.bmiHeader.biCompression = BI_RGB;
++    s_bmp = CreateDIBSection(s_dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
++    if (!s_bmp)
++        return 0;
++    SelectObject(s_dc, s_bmp);
++    SetBkMode(s_dc, TRANSPARENT);
++    s_px = (uint32_t *)bits;
++    s_w = w;
++    s_h = h;
++    return 1;
++}
++
++const uint32_t *xbox_MenuPixels(unsigned back_h, unsigned *w, unsigned *h, unsigned *gen)
++{
++    unsigned fpx, row, pad, W, H, sig = 2166136261u;
++    int i, y;
++
++    if (!s_open)
++        return NULL;
++    fpx = back_h / 42u;
++    if (fpx < 13u) fpx = 13u;
++    if (fpx > 40u) fpx = 40u;
++    row = fpx * 17u / 10u;
++    pad = fpx;
++    W = fpx * 30u;
++    H = pad * 2u + row * 2u + (unsigned)s_n * row + row * 3u / 2u;
++
++    /* Redraw only when something shown moved. */
++    sig = (sig ^ fpx) * 16777619u;
++    sig = (sig ^ (unsigned)s_sel) * 16777619u;
++    for (i = 0; i < s_n; i++)
++        sig = (sig ^ (unsigned)(s_items[i]->choices ? s_items[i]->get() + 1 : 0)) * 16777619u;
++    if (s_px && sig == s_sig && W == s_w && H == s_h)
++        goto out;
++    if (!make_surface(W, H, fpx))
++        return NULL;
++    s_sig = sig;
++
++    fill(0, 0, (int)W, (int)H, RGB(18, 14, 12));
++    fill(0, 0, (int)W, 3, RGB(170, 70, 40));
++    SelectObject(s_dc, s_font_big);
++    text((int)pad, (int)pad, (int)(W - 2 * pad), (int)row, "AJUSTES", DT_LEFT, RGB(235, 195, 125));
++    SelectObject(s_dc, s_font_small);
++    text((int)pad, (int)pad, (int)(W - 2 * pad), (int)row, "F2 / Esc: cerrar", DT_RIGHT,
++         RGB(150, 140, 130));
++    y = (int)(pad + row + row / 2);
++    for (i = 0; i < s_n; i++, y += (int)row) {
++        const xbox_menu_item *it = s_items[i];
++        if (!it->choices) {
++            SelectObject(s_dc, s_font_small);
++            text((int)pad, y, (int)(W - 2 * pad), (int)row, it->label, DT_LEFT | DT_BOTTOM,
++                 RGB(200, 110, 70));
++            fill((int)pad, y + (int)row - 2, (int)(W - 2 * pad), 1, RGB(90, 50, 35));
++            continue;
++        }
++        if (i == s_sel)
++            fill((int)pad / 2, y + 1, (int)(W - pad), (int)row - 2, RGB(125, 38, 26));
++        SelectObject(s_dc, s_font);
++        text((int)pad, y, (int)(W - 2 * pad), (int)row, it->label, DT_LEFT,
++             i == s_sel ? RGB(255, 255, 255) : RGB(215, 210, 200));
++        {
++            char v[128];
++            int c = it->get(), n = choice_count(it);
++            snprintf(v, sizeof v, "‹  %s  ›", c >= 0 && c < n ? it->choices[c] : "?");
++            text((int)pad, y, (int)(W - 2 * pad), (int)row, v, DT_RIGHT,
++                 i == s_sel ? RGB(255, 225, 150) : RGB(225, 185, 120));
++        }
++    }
++    SelectObject(s_dc, s_font_small);
++    text((int)pad, y + (int)row / 4, (int)(W - 2 * pad), (int)row,
++         "↑↓ elegir   ←→ cambiar   (se guarda solo)", DT_LEFT, RGB(150, 140, 130));
++    GdiFlush();
++    /* GDI leaves alpha at 0: the whole panel at 92%. */
++    for (i = 0; i < (int)(W * H); i++)
++        s_px[i] = (s_px[i] & 0x00FFFFFFu) | 0xEB000000u;
++    s_gen++;
++out:
++    *w = s_w;
++    *h = s_h;
++    *gen = s_gen;
++    return s_px;
++}
+diff --git a/src/d3d/host_menu.h b/src/d3d/host_menu.h
+new file mode 100644
+index 0000000..16be522
+--- /dev/null
++++ b/src/d3d/host_menu.h
+@@ -0,0 +1,54 @@
++/*
++ * host_menu.h - the F2 settings menu, drawn over the presented frame by the
++ * D3D11 backend (nv2a_pb_d3d11.c).
++ *
++ * Every row is a list of choices. The runtime adds its own (render scale,
++ * aspect, window size, fullscreen, filter, aniso, game speed); a title adds
++ * its own with xbox_MenuAdd before xbox_MenuLoad. A change applies at once
++ * (render options at the next flip) and every row is saved to the file
++ * xbox_MenuLoad was given, as key=choice lines, and applied again from it at
++ * the next start.
++ *
++ * Keys while open: Up/Down pick a row, Left/Right (or Enter) change it,
++ * F2 or Esc close. The game gets no key or mouse input meanwhile.
++ */
++#ifndef XBOX_HOST_MENU_H
++#define XBOX_HOST_MENU_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct xbox_menu_item {
++    const char *key;               /* saved as key=choice; NULL: not saved */
++    const char *label;             /* UTF-8 */
++    const char *const *choices;    /* NULL-terminated, UTF-8; NULL: a section title */
++    int  (*get)(void);             /* the current choice's index */
++    void (*set)(int i);            /* apply choice i */
++} xbox_menu_item;
++
++/* Adds a row (the struct is kept by pointer: give it static storage). */
++void xbox_MenuAdd(const xbox_menu_item *it);
++/* Applies the choices saved in path and saves every later change there. */
++void xbox_MenuLoad(const char *path);
++int  xbox_MenuIsOpen(void);
++
++/* ---- the window's side (nv2a_pb_d3d11.c) ---- */
++/* A key edge from the window; 1 when the menu took it. */
++int  xbox_MenuKey(int vk, int down, int repeat);
++/* The panel for a back buffer h lines tall, as top-down BGRA with alpha;
++ * *gen moves whenever the pixels do. NULL while closed. */
++const uint32_t *xbox_MenuPixels(unsigned back_h, unsigned *w, unsigned *h, unsigned *gen);
++
++/* nv2a_pb_d3d11.c: resize the window's client area at the next flip. */
++void nv2a_d3d11_window_request(unsigned w, unsigned h);
++/* nv2a_pb_d3d11.c: the full-screen glow off (1) or on (0); -1 only reads. */
++int  nv2a_d3d11_glow_off(int set);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index a7e653f..e4ab7ce 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -59,6 +59,7 @@
+ #endif
+ #include "nv2a_vsh_cpu.h"      /* the batch trace runs the CPU interpreter */
+ #include "shader_cache.h"
++#include "host_menu.h"            /* rdr-port: the F2 menu */
+ #include "xbox_memory_layout.h"   /* xbox_GetMemoryOffset */
+ #include "video/video_player.h"   /* xbox_FramebufferWindowTitleText */
+ #include "video/window_title.h"
+@@ -259,6 +260,8 @@ typedef struct {
+     uint32_t                fmt;        /* the SET_SURFACE_FORMAT word it was drawn with */
+     struct nv2a_rt_own      own;        /* is the guest memory under it still its own */
+     uint32_t                bar_flip[2]; /* hor+ band bars per third (nv2a_aspect_bar_mark) */
++    uint32_t                copy_of;    /* rdr-port: the larger target whose copy
++                                         * this holds (skip_rt_overlay), 0 none */
+ } RenderTarget;
+ 
+ typedef struct nv2a_stage Stage;
+@@ -312,6 +315,20 @@ extern int xbox_InputKeyboardOn(void);
+ 
+ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+ {
++    /* rdr-port: the F2 menu (host_menu.c) takes the keys while it is up,
++     * and the mouse's buttons and wheel, so the game is driven by none. */
++    if (m == WM_KEYDOWN || m == WM_KEYUP) {
++        if (xbox_MenuKey((int)w, m == WM_KEYDOWN, m == WM_KEYDOWN && (l & (1L << 30)) != 0))
++            return 0;
++    } else if (xbox_MenuIsOpen() && m >= WM_LBUTTONDOWN && m <= WM_MOUSEHWHEEL) {
++        if (m == WM_MOUSEWHEEL)
++            xbox_MenuKey((short)HIWORD(w) > 0 ? VK_UP : VK_DOWN, 1, 1);
++        else if (m == WM_LBUTTONDOWN)
++            xbox_MenuKey(VK_RIGHT, 1, 0);
++        else if (m == WM_RBUTTONDOWN)
++            xbox_MenuKey(VK_LEFT, 1, 0);
++        return 0;
++    }
+     /* The mouse only observes (motion, buttons, focus, the capture), so
+      * every message goes on to the cases below. */
+     xbox_InputMouseWin32Msg(h, m, (uintptr_t)w, (intptr_t)l);
+@@ -3414,29 +3431,70 @@ static int aspect_flat(const struct nv2a_pb_draw *d, const struct nv2a_pb_vsh *v
+     return 1;
+ }
+ 
+-/* RECOMP_D3D11_SKIP_RT=WxH: drop the batches that lay a W x H render
+- * target over a larger one, a title's full-screen glow or blur pass when
+- * it draws wrong. Red Dead Revolver's glow (a 512x256 copy of the frame
+- * fanned back over it at half alpha) left a seam through the screen's
+- * centre; 512x256 turns it off. The pass that fills the small target still
+- * runs, nothing reads it. Read after setup_pixel, which finds the stages'
+- * targets (s_stage_rt). */
++/* The full-screen glow off (rdr-port). Red Dead Revolver's glow copies the
++ * frame into a 512x256 target and fans that back over the frame at half
++ * alpha, which left a seam through the screen's centre. A target drawn
++ * from a larger one is marked a copy of it (rt_copy_mark), and a batch
++ * that lays such a copy back over the target it was copied from is
++ * dropped. Targets drawn from textures (the menu's book, the posters) are
++ * no copy and keep drawing, which a size alone (the first version) could
++ * not tell apart. RECOMP_D3D11_SKIP_RT=WxH turns it on at start for copies
++ * of that size, =1 for any size; the F2 menu flips it live
++ * (nv2a_d3d11_glow_off). */
++static int s_glow_off = -1, s_glow_w, s_glow_h;
++
++static void glow_env(void)
++{
++    const char *e;
++    if (s_glow_off >= 0)
++        return;
++    e = getenv("RECOMP_D3D11_SKIP_RT");
++    s_glow_off = e && *e && *e != '0';
++    if (s_glow_off && sscanf(e, "%dx%d", &s_glow_w, &s_glow_h) != 2)
++        s_glow_w = s_glow_h = 0;
++}
++
++int nv2a_d3d11_glow_off(int set)
++{
++    glow_env();
++    if (set >= 0) {
++        s_glow_off = set != 0;
++        s_glow_w = s_glow_h = 0;
++    }
++    return s_glow_off;
++}
++
++/* After setup_pixel (s_stage_rt): what rt now holds. A copy of a larger
++ * target, or of a copy (the glow's blur passes between two small targets),
++ * or nothing of the kind. */
++static void rt_copy_mark(RenderTarget *rt)
++{
++    uint32_t of = 0;
++    int n;
++    for (n = 0; n < 4; n++) {
++        const RenderTarget *src = s_stage_rt[n];
++        if (!src || src == &s_self || src == rt)
++            continue;
++        if (src->w > rt->w && src->h > rt->h)
++            of = src->offset;
++        else if (src->copy_of && !of)
++            of = src->copy_of;
++    }
++    rt->copy_of = of;
++}
++
+ static int skip_rt_overlay(const RenderTarget *rt)
+ {
+-    static int w = -1, h;
+     int n;
+ 
+-    if (w < 0) {
+-        const char *e = getenv("RECOMP_D3D11_SKIP_RT");
+-        if (!e || sscanf(e, "%dx%d", &w, &h) != 2 || w <= 0 || h <= 0)
+-            w = 0;
+-    }
+-    if (!w)
++    glow_env();
++    if (!s_glow_off)
+         return 0;
+     for (n = 0; n < 4; n++) {
+         const RenderTarget *src = s_stage_rt[n];
+-        if (src && src != &s_self && src != rt && (int)src->w == w && (int)src->h == h
+-                && rt->w > src->w)
++        if (src && src != &s_self && src != rt && src->copy_of == rt->offset
++                && rt->w > src->w
++                && (!s_glow_w || ((int)src->w == s_glow_w && (int)src->h == s_glow_h)))
+             return 1;
+     }
+     return 0;
+@@ -3863,6 +3921,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
+             s_draws_skipped++;
+             return;
+         }
++        rt_copy_mark(rt);
+         if (hp.place != NV2A_PLACE_CENTRE)
+             s_draws_stretch++;
+         if (hp.two_d && !have_x) {
+@@ -4280,6 +4339,124 @@ static void present_extent(RenderTarget *rt, UINT *w, UINT *h)
+  * filtered, less display.overscan's edges (nv2a_present_crop). Under
+  * present.surface=internal the back buffer is the frame: the crop fills it,
+  * point-sampled for integer as Metal's internal present is. */
++/* rdr-port: the F2 menu's panel (host_menu.c), blended over the back
++ * buffer before the present, centred, at most the back buffer's size. */
++static const char s_menu_ps_src[] =
++    "Texture2D t0 : register(t0); SamplerState s0 : register(s0);\n"
++    "float4 main(float4 p : SV_Position, float2 t : TEXCOORD0) : SV_Target {\n"
++    "    return t0.Sample(s0, t);\n"
++    "}\n";
++static ID3D11PixelShader        *s_menu_ps;
++static ID3D11BlendState         *s_menu_bs;
++static ID3D11Texture2D          *s_menu_tex;
++static ID3D11ShaderResourceView *s_menu_srv;
++static unsigned s_menu_tw, s_menu_th, s_menu_gen = ~0u;
++static int s_menu_failed;
++
++static void menu_present(void)
++{
++    ID3D11ShaderResourceView *none = NULL;
++    const uint32_t *px;
++    unsigned w, h, gen;
++    float sx, sy, k;
++    D3D11_VIEWPORT vp;
++
++    if (!s_back || s_menu_failed || !(px = xbox_MenuPixels(s_back_h, &w, &h, &gen)))
++        return;
++    if (!blit_init())
++        return;
++    if (!s_menu_ps) {
++        ID3DBlob *code = NULL;
++        D3D11_BLEND_DESC bd;
++        s_menu_failed = 1;
++        if (!compile("rdr_menu_ps", s_menu_ps_src, "ps_5_0", &code))
++            return;
++        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
++                                       ID3D10Blob_GetBufferSize(code), NULL, &s_menu_ps);
++        ID3D10Blob_Release(code);
++        memset(&bd, 0, sizeof bd);
++        bd.RenderTarget[0].BlendEnable = TRUE;
++        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
++        bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
++        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
++        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
++        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
++        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
++        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
++        if (!s_menu_ps || FAILED(ID3D11Device_CreateBlendState(s_dev, &bd, &s_menu_bs)))
++            return;
++        s_menu_failed = 0;
++    }
++    if (!s_menu_tex || w != s_menu_tw || h != s_menu_th) {
++        D3D11_TEXTURE2D_DESC td;
++        if (s_menu_srv) ID3D11ShaderResourceView_Release(s_menu_srv);
++        if (s_menu_tex) ID3D11Texture2D_Release(s_menu_tex);
++        s_menu_srv = NULL;
++        s_menu_tex = NULL;
++        memset(&td, 0, sizeof td);
++        td.Width = w;
++        td.Height = h;
++        td.MipLevels = 1;
++        td.ArraySize = 1;
++        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++        td.SampleDesc.Count = 1;
++        td.Usage = D3D11_USAGE_DEFAULT;
++        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_menu_tex))
++                || FAILED(ID3D11Device_CreateShaderResourceView(
++                       s_dev, (ID3D11Resource *)s_menu_tex, NULL, &s_menu_srv)))
++            return;
++        s_menu_tw = w;
++        s_menu_th = h;
++        s_menu_gen = gen - 1u;
++    }
++    if (gen != s_menu_gen) {
++        ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_menu_tex, 0, NULL,
++                                              px, w * 4u, 0);
++        s_menu_gen = gen;
++    }
++    if (!s_back_rtv && FAILED(ID3D11Device_CreateRenderTargetView(
++                s_dev, (ID3D11Resource *)s_back, NULL, &s_back_rtv)))
++        return;
++    {
++        D3D11_MAPPED_SUBRESOURCE m;
++        float uv[4] = {1.0f, 1.0f, 0.0f, 0.0f};
++        if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
++                                           D3D11_MAP_WRITE_DISCARD, 0, &m)))
++            return;
++        memcpy(m.pData, uv, sizeof uv);
++        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_blit_cb, 0);
++    }
++    sx = (float)s_back_w / (float)w;
++    sy = (float)s_back_h / (float)h;
++    k = sx < sy ? sx : sy;
++    if (k > 1.0f)
++        k = 1.0f;
++    vp.Width = (float)w * k;
++    vp.Height = (float)h * k;
++    vp.TopLeftX = ((float)s_back_w - vp.Width) * 0.5f;
++    vp.TopLeftY = ((float)s_back_h - vp.Height) * 0.5f;
++    vp.MinDepth = 0.0f;
++    vp.MaxDepth = 1.0f;
++    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back_rtv, NULL);
++    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
++    ID3D11DeviceContext_RSSetState(s_ctx, s_rs[0][0]);
++    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_menu_bs, NULL, 0xFFFFFFFF);
++    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_off, 0);
++    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
++    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
++    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_blit_cb);
++    ID3D11DeviceContext_PSSetShader(s_ctx, s_menu_ps, NULL, 0);
++    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s_menu_srv);
++    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp[k < 1.0f]);
++    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
++    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
++    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFF);
++    /* Every binding above went behind the draw path's state shadow. */
++    s_sc_init = 0;
++}
++
+ #ifdef XBOXRECOMP_ENHANCE
+ static struct nv2a_rect s_ovl_place;    /* the overlay's: the frame in the back buffer */
+ #endif
+@@ -4975,6 +5152,7 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
+     ovl_present();
+     nv2a_stats_add(NV2A_STAT_PRESENTS, 1);
+ #endif
++    menu_present();
+     hr = IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
+     if (FAILED(hr) && s_presents < 4)
+         fprintf(stderr, LOGP "Present hr=0x%08lX\n", (unsigned long)hr);
+@@ -5132,6 +5310,41 @@ static void fullscreen_switch(int full)
+             full ? "on" : "off", (long)(r.right - r.left), (long)(r.bottom - r.top));
+ }
+ 
++/* rdr-port: the menu's window size (nv2a_d3d11_window_request), the client
++ * area set at the flip on this thread, which owns the window. While
++ * fullscreen it waits for the window to come back. */
++static volatile LONG s_win_req;
++static unsigned s_win_req_w, s_win_req_h;
++
++void nv2a_d3d11_window_request(unsigned w, unsigned h)
++{
++    s_win_req_w = w;
++    s_win_req_h = h;
++    InterlockedExchange(&s_win_req, 1);
++}
++
++static void window_apply(void)
++{
++    RECT r;
++    DWORD style;
++
++    if (!s_hwnd || !s_win_req)
++        return;
++    if (nv2a_host_opts()->fullscreen)
++        return;
++    InterlockedExchange(&s_win_req, 0);
++    if (IsZoomed(s_hwnd))
++        ShowWindow(s_hwnd, SW_RESTORE);
++    style = (DWORD)GetWindowLongPtrW(s_hwnd, GWL_STYLE);
++    r.left = r.top = 0;
++    r.right = (LONG)s_win_req_w;
++    r.bottom = (LONG)s_win_req_h;
++    AdjustWindowRect(&r, style, FALSE);
++    SetWindowPos(s_hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
++                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOOWNERZORDER);
++    fprintf(stderr, LOGP "window %ux%u (menu)\n", s_win_req_w, s_win_req_h);
++}
++
+ /* Live options (nv2a_host_opts_request) are applied after the present:
+  * the one point where no target is bound and no upload is in flight, and
+  * the frame shown was drawn at the old render.scale, which the present
+@@ -5144,10 +5357,11 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
+     unsigned changed;
+     d3d11_flip(surface_offset, pitch);
+     changed = nv2a_host_opts_apply();
+-    if ((changed & NV2A_OPT_SCALE) && s_dev)
++    if ((changed & (NV2A_OPT_SCALE | NV2A_OPT_ASPECT)) && s_dev)
+         scale_drop();
+     if (changed & NV2A_OPT_FULLSCREEN)
+         fullscreen_switch(nv2a_host_opts()->fullscreen);
++    window_apply();
+ }
+ 
+ /* ---- registration ---------------------------------------------------------- */
+diff --git a/src/kernel/nv2a_backend_common.c b/src/kernel/nv2a_backend_common.c
+index 8c8d8aa..1e05db8 100644
+--- a/src/kernel/nv2a_backend_common.c
++++ b/src/kernel/nv2a_backend_common.c
+@@ -1025,6 +1025,10 @@ void nv2a_host_opts_request(const struct nv2a_host_opts *o, unsigned mask)
+         s_req_opts.overscan = o->overscan;
+     if (mask & NV2A_OPT_SNAP2D)
+         s_req_opts.snap_2d = o->snap_2d;
++    if (mask & NV2A_OPT_ASPECT) {
++        s_req_opts.aspect_w = o->aspect_w;
++        s_req_opts.aspect_h = o->aspect_h;
++    }
+     s_req_mask |= mask;
+     req_unlock();
+     atomic_store_explicit(&s_req_pending, 1u, memory_order_release);
+@@ -1096,6 +1100,17 @@ unsigned nv2a_host_opts_apply(void)
+         s_host_opts.snap_2d = r.snap_2d != 0;
+         changed |= NV2A_OPT_SNAP2D;
+     }
++    if ((mask & NV2A_OPT_ASPECT)
++        && (r.aspect_w != s_host_opts.aspect_w || r.aspect_h != s_host_opts.aspect_h)) {
++        /* 4:3 is stock (no padding), as at start. */
++        int stock = !r.aspect_w || !r.aspect_h || r.aspect_w * 3u == r.aspect_h * 4u;
++        s_host_opts.aspect_w = stock ? 0u : r.aspect_w;
++        s_host_opts.aspect_h = stock ? 0u : r.aspect_h;
++        /* The 4:3 edges sit inside the padded frame: no overscan crop. */
++        if (s_host_opts.aspect_w)
++            s_host_opts.overscan = 0;
++        changed |= NV2A_OPT_ASPECT;
++    }
+     if (changed)
+         atomic_fetch_add_explicit(&s_opts_gen, 1u, memory_order_release);
+     return changed;
+diff --git a/src/kernel/nv2a_backend_common.h b/src/kernel/nv2a_backend_common.h
+index 1962dab..119cf26 100644
+--- a/src/kernel/nv2a_backend_common.h
++++ b/src/kernel/nv2a_backend_common.h
+@@ -1449,6 +1449,9 @@ struct nv2a_host_opts {
+ #define NV2A_OPT_MOVIE      0x20u
+ #define NV2A_OPT_OVERSCAN   0x40u
+ #define NV2A_OPT_SNAP2D     0x80u
++/* display.aspect (rdr-port): the pads change every target's size, so the
++ * backend drops its targets as for SCALE. */
++#define NV2A_OPT_ASPECT     0x100u
+ /* display.overscan's range (enhance.c clamps the key to it): 10% of a
+  * 640-wide frame a side, past any TV's overscan. */
+ #define NV2A_OVERSCAN_MAX   64u
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,70 @@
+From 43be546d020eab11750850de6cd18bdc71cb833e Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 06:19:47 -0300
+Subject: [PATCH 07/47] mouse: direct look, the title's camera takes the raw
+ counts
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/input/mouse.c | 21 +++++++++++++++++++++
+ src/input/mouse.h |  5 +++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/src/input/mouse.c b/src/input/mouse.c
+index a057890..194966b 100644
+--- a/src/input/mouse.c
++++ b/src/input/mouse.c
+@@ -399,6 +399,25 @@ int xbox_InputMouseTakeCounts(int *dx, int *dy)
+ }
+ #endif
+ 
++/* Direct look (a title's camera reads the counts itself, as in BLACK's
++ * port): the stick gets no motion and xbox_InputMouseTakeLook hands the
++ * counts over. */
++static int s_direct;
++
++void xbox_InputMouseDirect(int on)
++{
++    STORE(&s_direct, on != 0);
++}
++
++int xbox_InputMouseTakeLook(int *dx, int *dy)
++{
++    *dx = XCHG(&s_dx, 0);
++    *dy = XCHG(&s_dy, 0);
++    if (*dx > 20000) *dx = 20000; else if (*dx < -20000) *dx = -20000;
++    if (*dy > 20000) *dy = 20000; else if (*dy < -20000) *dy = -20000;
++    return *dx || *dy;
++}
++
+ int xbox_InputMouseLook(int *x, int *y)
+ {
+     static unsigned traced;
+@@ -406,6 +425,8 @@ int xbox_InputMouseLook(int *x, int *y)
+     int dx, dy;
+ 
+     *x = *y = 0;
++    if (LOAD(&s_direct))
++        return o->look;
+ #ifdef XBOXRECOMP_ENHANCE
+     if (LOAD(&s_divert))
+         return o->look;
+diff --git a/src/input/mouse.h b/src/input/mouse.h
+index 545a9eb..3ed1762 100644
+--- a/src/input/mouse.h
++++ b/src/input/mouse.h
+@@ -97,6 +97,11 @@ int  xbox_InputMouseHeld(int code);
+  * values for the opts.look stick (0, 0 when none or at rest). Returns the
+  * stick (XBOX_MOUSE_LOOK_*). */
+ int  xbox_InputMouseLook(int *x, int *y);
++/* Direct look: on, the stick gets no mouse motion and the title's own
++ * camera code takes the raw counts (each clamped to +-20000) with
++ * xbox_InputMouseTakeLook, which returns nonzero when there were any. */
++void xbox_InputMouseDirect(int on);
++int  xbox_InputMouseTakeLook(int *dx, int *dy);
+ #ifdef XBOXRECOMP_ENHANCE
+ /* The enhancements layer's input capture (src/enhance/enhance_input.h).
+  * While diverted, xbox_InputMouseLook gives the pad no motion and the
+-- 
+2.55.0.windows.3
+

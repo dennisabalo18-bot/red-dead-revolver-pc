@@ -1,0 +1,35 @@
+From a70565491c7f3912a5eb24ee056fa7a3c528f413 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 06:30:32 -0300
+Subject: [PATCH 47/47] F2 menu: the texture dump is never restored from
+ rdr_menu.ini
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/host_menu.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/d3d/host_menu.c b/src/d3d/host_menu.c
+index 333a03d..de52ce2 100644
+--- a/src/d3d/host_menu.c
++++ b/src/d3d/host_menu.c
+@@ -135,7 +135,15 @@ static void set_aniso(int i)
+ 
+ 
+ static int get_dump(void) { return nv2a_d3d11_tex_dump(); }
+-static void set_dump(int i) { nv2a_d3d11_tex_dump_set(i); }
++/* rdr-port: never from rdr_menu.ini: a dump left on in one session went on
++ * dumping in every later one, into the player's Mods-Extras. Each run starts
++ * with it off (RECOMP_TEXTURES_DUMP=1 still turns it on). */
++static void set_dump(int i)
++{
++    if (s_loading)
++        return;
++    nv2a_d3d11_tex_dump_set(i);
++}
+ 
+ static int get_vsync(void) { return nv2a_d3d11_vsync(-1); }
+ static void set_vsync(int i) { nv2a_d3d11_vsync(i); }
+-- 
+2.55.0.windows.3
+

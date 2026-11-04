@@ -1,0 +1,6 @@
+Changes to the runtime (fork of https://github.com/apexJCL/xboxrecomp), one patch per commit.
+Base commit: see BASE.txt (e5a7087, "docs: CHANGELOG-blinx2.md for blinx2-v0.8.0").
+
+    git clone https://github.com/apexJCL/xboxrecomp.git xboxrecomp-apex
+    git -C xboxrecomp-apex checkout -b rdr-port e5a7087
+    git -C xboxrecomp-apex am ../patches/xboxrecomp-apex/*.patch

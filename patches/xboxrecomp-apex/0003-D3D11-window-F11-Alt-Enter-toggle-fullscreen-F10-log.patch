@@ -1,0 +1,76 @@
+From 8c3dbb544c835496dc564109edc3efbe88f9c42f Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 05:18:10 -0300
+Subject: [PATCH 03/47] D3D11 window: F11 / Alt+Enter toggle fullscreen, F10
+ logs the next flip's methods
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/nv2a_pb_d3d11.c   | 18 ++++++++++++++++++
+ src/kernel/nv2a_pb_exec.c | 14 ++++++++++++++
+ 2 files changed, 32 insertions(+)
+
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index e91cef8..03710c2 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -316,6 +316,24 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+      * every message goes on to the cases below. */
+     xbox_InputMouseWin32Msg(h, m, (uintptr_t)w, (intptr_t)l);
+ 
++    /* rdr-port host keys, taken before the guest sees them: F11 or
++     * Alt+Enter toggles borderless fullscreen (applied at the next flip by
++     * fullscreen_switch), F10 logs the next flip's method stream
++     * ([MLOG], nv2a_pb_mlog_request). */
++    if ((m == WM_KEYDOWN || m == WM_SYSKEYDOWN) && !(l & (1L << 30))) {
++        if (w == VK_F11 || (w == VK_RETURN && (GetKeyState(VK_MENU) & 0x8000))) {
++            struct nv2a_host_opts o = *nv2a_host_opts();
++            o.fullscreen = !o.fullscreen;
++            nv2a_host_opts_request(&o, NV2A_OPT_FULLSCREEN);
++            return 0;
++        }
++        if (w == VK_F10) {
++            extern void nv2a_pb_mlog_request(void);
++            nv2a_pb_mlog_request();
++            return 0;
++        }
++    }
++
+     switch (m) {
+     /* Keys for the port-0 keyboard, as the GDI window (fb_present.c)
+      * records them. This window is the only one a D3D11 run has, so
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 4bf906c..2046c02 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -6992,6 +6992,14 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
+     }
+     return 0;
+ }
++/* rdr-port: set by nv2a_pb_mlog_request (any thread), taken at the next
++ * method: the flip after it is logged as RENV_PB_MLOG would log it. */
++static volatile int s_mlog_request;
++void nv2a_pb_mlog_request(void)
++{
++    __atomic_store_n(&s_mlog_request, 1, __ATOMIC_RELEASE);
++}
++
+ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+ {
+     static int inited;
+@@ -7066,6 +7074,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+             const char *e = recomp_env(RENV_PB_MLOG);
+             mlog_flip = e ? strtol(e, NULL, 0) : -1;
+         }
++        /* rdr-port: a host key (F10 in the D3D11 window) asks for the next
++         * flip's stream, for a glitch seen on screen. */
++        if (__atomic_exchange_n(&s_mlog_request, 0, __ATOMIC_ACQ_REL)) {
++            mlog_flip = (long)s_gpu.flips + 1;
++            fprintf(stderr, "[MLOG] capturing flip %ld\n", mlog_flip);
++        }
+         if (mlog_flip >= 0 && s_gpu.flips == (uint32_t)mlog_flip)
+             fprintf(stderr, "[MLOG] %u %04X %08X\n", subch, method, param);
+     }
+-- 
+2.55.0.windows.3
+

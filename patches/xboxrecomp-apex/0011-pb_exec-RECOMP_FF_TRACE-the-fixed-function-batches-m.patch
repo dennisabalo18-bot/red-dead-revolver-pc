@@ -1,0 +1,105 @@
+From 05bf06ff46b305ec4b818ae52b07d915c7b9a9ff Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 12:14:12 -0300
+Subject: [PATCH 11/47] pb_exec: RECOMP_FF_TRACE, the fixed-function batches'
+ matrices every 2 s
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/nv2a_pb_exec.c | 73 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 73 insertions(+)
+
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 2046c02..121da8c 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -3102,6 +3102,78 @@ static int ff_begin(void)
+     return 1;
+ }
+ 
++/* rdr-port: RECOMP_FF_TRACE=1 (run.bat sets it): every 2 s, the
++ * fixed-function batches of one flip, up to 16 distinct composites: the
++ * composite matrix (constant rows 0..3), viewport offset and scale, the
++ * surface clip, and the first vertices' positions with where they land
++ * ((composite . pos) / w + offset, as the program the backends draw).
++ * For the smoke and reticle sprites that land shrunk to the top left. */
++static void ff_trace(void)
++{
++    static int on = -1;
++    static uint32_t armed_flip = 0xFFFFFFFFu; static uint64_t last_ms;
++    static uint32_t seen[16];
++    static int nseen;
++    uint32_t h = 2166136261u, i, n;
++    int k;
++
++    if (on < 0) {
++        const char *e = getenv("RECOMP_FF_TRACE");
++        on = e && *e == '1';
++    }
++    if (!on || !s_ff_active)
++        return;
++    {
++        uint64_t now = (uint64_t)GetTickCount64();
++        if (armed_flip != s_gpu.flips) {
++            if (now - last_ms < 2000)
++                return;
++            last_ms = now;
++            armed_flip = s_gpu.flips;
++            nseen = 0;
++            fprintf(stderr, "[FFTRACE] flip %u\n", s_gpu.flips);
++        }
++    }
++    for (k = 0; k < 16; k++) {
++        uint32_t u;
++        memcpy(&u, &s_vsh.c[k >> 2][k & 3], 4);
++        h = (h ^ u) * 16777619u;
++    }
++    for (k = 0; k < nseen; k++)
++        if (seen[k] == h)
++            return;
++    if (nseen >= 16)
++        return;
++    seen[nseen++] = h;
++    fprintf(stderr, "[FFTRACE] prim %u n %u clip %ux%u+%u+%u surf 0x%08X skin %u\n"
++            "[FFTRACE]  cmat % .5g % .5g % .5g % .5g | % .5g % .5g % .5g % .5g |"
++            " % .5g % .5g % .5g % .5g | % .5g % .5g % .5g % .5g\n"
++            "[FFTRACE]  vpoff % .5g % .5g % .5g % .5g  vpscl % .5g % .5g % .5g % .5g\n",
++            s_gpu.prim, s_gpu.idx_count, s_gpu.clip_w, s_gpu.clip_h, s_gpu.clip_x,
++            s_gpu.clip_y, s_gpu.color_offset, (unsigned)s_vsh.ff.skin,
++            s_vsh.c[0][0], s_vsh.c[0][1], s_vsh.c[0][2], s_vsh.c[0][3],
++            s_vsh.c[1][0], s_vsh.c[1][1], s_vsh.c[1][2], s_vsh.c[1][3],
++            s_vsh.c[2][0], s_vsh.c[2][1], s_vsh.c[2][2], s_vsh.c[2][3],
++            s_vsh.c[3][0], s_vsh.c[3][1], s_vsh.c[3][2], s_vsh.c[3][3],
++            s_vsh.vp_off[0], s_vsh.vp_off[1], s_vsh.vp_off[2], s_vsh.vp_off[3],
++            s_vsh.vp_scale[0], s_vsh.vp_scale[1], s_vsh.vp_scale[2], s_vsh.vp_scale[3]);
++    n = s_gpu.idx_count < 4 ? s_gpu.idx_count : 4;
++    for (i = 0; i < n; i++) {
++        float p[4], o[4];
++        int j;
++        if (!fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], p))
++            continue;
++        for (j = 0; j < 4; j++)
++            o[j] = p[0] * s_vsh.c[j][0] + p[1] * s_vsh.c[j][1] + p[2] * s_vsh.c[j][2]
++                 + p[3] * s_vsh.c[j][3];
++        fprintf(stderr, "[FFTRACE]  v%u (% .4g % .4g % .4g % .4g) -> clip (% .4g % .4g % .4g % .4g)"
++                " screen (%.1f, %.1f)\n", i, p[0], p[1], p[2], p[3], o[0], o[1], o[2], o[3],
++                o[3] != 0.0f ? o[0] / o[3] + s_vsh.vp_off[0] : 0.0f,
++                o[3] != 0.0f ? o[1] / o[3] + s_vsh.vp_off[1] : 0.0f);
++    }
++    fflush(stderr);
++}
++
+ static void ff_end(void)
+ {
+     if (!s_ff_active)
+@@ -6547,6 +6619,7 @@ static void draw_primitive(void)
+         s_perf.batches += s_draw_batches;
+         return;
+     }
++    ff_trace();
+     vsh_const_dump_draw();
+     vsh_note_gpu();
+     fb_prog_draw();
+-- 
+2.55.0.windows.3
+

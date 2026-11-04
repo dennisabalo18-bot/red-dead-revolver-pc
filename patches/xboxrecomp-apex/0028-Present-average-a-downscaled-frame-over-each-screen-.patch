@@ -1,0 +1,44 @@
+From 2dad3cf18749fbe3ae84b84427227e5c1d2d4fbd Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 15:36:52 -0300
+Subject: [PATCH 28/47] Present: average a downscaled frame over each screen
+ pixel's footprint (supersampling at render scale 3-4)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/nv2a_pb_d3d11.c | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index 067529e..45e0efc 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -4512,10 +4512,24 @@ static const char s_blit_vs_src[] =
+     "    o.t = o.t * uv_scale.xy + uv_scale.zw;\n"
+     "    return o;\n"
+     "}\n";
++/* rdr-port: a frame larger than its place on screen (render scale 3 or 4 on
++ * a 1080p window) is averaged over each screen pixel's whole footprint, 4x4
++ * filtered taps: supersampling. One tap per pixel threw the extra pixels
++ * away and kept the 3D edges' stairs. 1:1 or enlarged, one tap as before. */
+ static const char s_blit_ps_src[] =
+     "Texture2D t0 : register(t0); SamplerState s0 : register(s0);\n"
+     "float4 main(float4 p : SV_Position, float2 t : TEXCOORD0) : SV_Target {\n"
+-    "    return float4(t0.Sample(s0, t).rgb, 1);\n"
++    "    float2 dx = ddx(t), dy = ddy(t);\n"
++    "    uint w, h;\n"
++    "    t0.GetDimensions(w, h);\n"
++    "    float2 f = float2(abs(dx.x) + abs(dy.x), abs(dx.y) + abs(dy.y)) * float2(w, h);\n"
++    "    if (max(f.x, f.y) <= 1.01) return float4(t0.SampleLevel(s0, t, 0).rgb, 1);\n"
++    "    float3 c = 0;\n"
++    "    [unroll] for (int j = 0; j < 4; j++)\n"
++    "        [unroll] for (int i = 0; i < 4; i++)\n"
++    "            c += t0.SampleLevel(s0, t + dx * ((i + 0.5) / 4.0 - 0.5)\n"
++    "                                      + dy * ((j + 0.5) / 4.0 - 0.5), 0).rgb;\n"
++    "    return float4(c / 16.0, 1);\n"
+     "}\n";
+ static ID3D11VertexShader *s_blit_vs;
+ static ID3D11PixelShader  *s_blit_ps;
+-- 
+2.55.0.windows.3
+

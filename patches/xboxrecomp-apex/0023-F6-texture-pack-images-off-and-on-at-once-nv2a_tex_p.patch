@@ -1,0 +1,76 @@
+From b4b52f9bc5ec7de83504bbe1b06a4f66b44cfbb9 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 00:28:07 -0300
+Subject: [PATCH 23/47] F6: texture pack images off and on at once;
+ nv2a_tex_pack_kind_enabled
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/host_menu.c        | 2 +-
+ src/d3d/nv2a_pb_d3d11.c    | 6 ++++++
+ src/kernel/nv2a_tex_pack.c | 6 ++++++
+ src/kernel/nv2a_tex_pack.h | 1 +
+ 4 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/src/d3d/host_menu.c b/src/d3d/host_menu.c
+index 97b4335..0a6561c 100644
+--- a/src/d3d/host_menu.c
++++ b/src/d3d/host_menu.c
+@@ -329,7 +329,7 @@ int xbox_MenuKey(int vk, int down, int repeat)
+         return 0;
+     }
+     /* The host's own keys still work with the menu up. */
+-    if (vk == VK_F8 || vk == VK_F10 || vk == VK_F11)
++    if (vk == VK_F6 || vk == VK_F8 || vk == VK_F10 || vk == VK_F11)
+         return 0;
+     if (!down)
+         return 1;
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index 6ceea39..455cb89 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -356,6 +356,12 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+             nv2a_pb_mlog_request();
+             return 0;
+         }
++        /* F6: the texture pack's images off and on, to see the difference
++         * at once (the F2 row "Texturas mejoradas" shows the same). */
++        if (w == VK_F6 && nv2a_tex_pack_count()) {
++            nv2a_tex_pack_set_kind_enabled(XRTP_KIND_ART, !nv2a_tex_pack_kind_enabled(XRTP_KIND_ART));
++            return 0;
++        }
+         /* Ctrl+F8: game speed x1 -> x2 -> x4 -> x1 (kernel_pacing.h). F8 alone
+          * reached the window by itself (a hotkey of another program) and
+          * left the game running at x2 from the title screen. */
+diff --git a/src/kernel/nv2a_tex_pack.c b/src/kernel/nv2a_tex_pack.c
+index d76c652..2a691a4 100644
+--- a/src/kernel/nv2a_tex_pack.c
++++ b/src/kernel/nv2a_tex_pack.c
+@@ -327,6 +327,12 @@ void nv2a_tex_pack_set_kind_enabled(uint32_t kind, int on)
+     set_mask(on ? m | (1u << kind) : m & ~(1u << kind));
+ }
+ 
++int nv2a_tex_pack_kind_enabled(uint32_t kind)
++{
++    return kind < XRTP_KIND_COUNT
++        && (atomic_load_explicit(&s_mask, memory_order_relaxed) & (1u << kind)) != 0;
++}
++
+ uint32_t nv2a_tex_pack_gen(void)
+ {
+     return atomic_load_explicit(&s_gen, memory_order_relaxed);
+diff --git a/src/kernel/nv2a_tex_pack.h b/src/kernel/nv2a_tex_pack.h
+index 92bdf4b..59f4f49 100644
+--- a/src/kernel/nv2a_tex_pack.h
++++ b/src/kernel/nv2a_tex_pack.h
+@@ -92,6 +92,7 @@ size_t nv2a_tex_pack_bc3_bytes(uint32_t w, uint32_t h, uint32_t levels);
+  * generation is uploaded again. Unload is not offered at run time. */
+ void nv2a_tex_pack_set_enabled(int on);
+ void nv2a_tex_pack_set_kind_enabled(uint32_t kind, int on);
++int nv2a_tex_pack_kind_enabled(uint32_t kind);
+ uint32_t nv2a_tex_pack_gen(void);
+ /* Hits of nv2a_tex_pack_find, for the backends' statistics. */
+ uint64_t nv2a_tex_pack_hits(void);
+-- 
+2.55.0.windows.3
+

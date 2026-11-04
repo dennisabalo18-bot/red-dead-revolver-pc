@@ -1,0 +1,36 @@
+From d526e832385dccb1773752b65ac12b386df92cb5 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 14:51:50 -0300
+Subject: [PATCH 26/47] set_vp: guest pixel centres onto their blocks' centres
+ at render scale (the letterbox's dotted edge rows)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/nv2a_pb_d3d11.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index bc3b34e..c9b8d93 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -3817,6 +3817,17 @@ static void set_vp(const struct nv2a_pb_vsh *v, const struct nv2a_pb_gpu *g,
+ 
+     nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, rt->pad, &vc);
+     nv2a_aspect_map(&vc, rt->w, rt->h, rt->pad, place);
++    /* rdr-port: at render scale n, the guest's edge on a pixel's centre
++     * (x.5: the letterbox bars, the 2D quads) lands n/2 host pixels inside
++     * that pixel's block and leaves its first host row or column uncovered:
++     * a dotted line of the scene above the top bar and below the bottom
++     * one. Shifting by (n-1)/2 host pixels maps the guest's pixel centres
++     * onto the centres of their blocks, as at 1x. */
++    if (rt->n > 1) {
++        float d = -0.5f * (float)(rt->n - 1) / (float)rt->n;   /* guest pixels */
++        vc.c[4] += vc.c[0] * d;
++        vc.c[5] += vc.c[1] * d;
++    }
+     /* Screen positions on an anti-aliased surface are in its clip's units:
+      * x and y reach the surface's pixels times the factor (nv2a_aa_x). */
+     vc.c[0] *= (float)nv2a_aa_x(g->format);
+-- 
+2.55.0.windows.3
+

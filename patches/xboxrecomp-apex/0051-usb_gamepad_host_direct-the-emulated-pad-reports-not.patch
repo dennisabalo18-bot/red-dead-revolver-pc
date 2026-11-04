@@ -1,0 +1,59 @@
+From 6f6b4790239dec4d1c3ae43b5a85947883f0bf1a Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 15:00:32 -0300
+Subject: [PATCH] usb_gamepad_host_direct: the emulated pad reports nothing and
+ polls nothing
+
+For a game that reads the host state itself (rdr: its XInputGetState is
+replaced): a poll from the USB side would take the mouse motion and the
+keyboard's edges away from the game's own read.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/usb/usb_gamepad.c | 6 ++++++
+ src/usb/usb_gamepad.h | 5 +++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/src/usb/usb_gamepad.c b/src/usb/usb_gamepad.c
+index 3862f56..c0e72b8 100644
+--- a/src/usb/usb_gamepad.c
++++ b/src/usb/usb_gamepad.c
+@@ -80,6 +80,8 @@ static const UsbPadSource *s_source;
+ 
+ void usb_gamepad_set_source(const UsbPadSource *src) { s_source = src; }
+ const UsbPadSource *usb_gamepad_source(void) { return s_source; }
++static volatile int s_host_direct;
++void usb_gamepad_host_direct(int on) { s_host_direct = on != 0; }
+ 
+ /* ---- control transfers ------------------------------------------------- */
+ 
+@@ -731,6 +733,10 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
+      * with a game's source installed the source drives it instead. */
+     if (pad != 0)
+         synth = 0;
++    if (s_host_direct) {
++        out[2] = synth;
++        return 20;
++    }
+     if (s_source) {
+         memset(&state, 0, sizeof state);
+         if (!s_source->get_state || !s_source->get_state(pad, &state.Gamepad))
+diff --git a/src/usb/usb_gamepad.h b/src/usb/usb_gamepad.h
+index 9463ded..f97803f 100644
+--- a/src/usb/usb_gamepad.h
++++ b/src/usb/usb_gamepad.h
+@@ -78,6 +78,11 @@ typedef struct {
+ } UsbPadSource;
+ 
+ void usb_gamepad_set_source(const UsbPadSource *src);
++/* rdr-port: the game reads the host state itself (its XInputGetState is
++ * replaced), so the emulated pad reports nothing pressed and never polls
++ * the host: a poll from here would take the mouse motion and the keyboard's
++ * edges away from the game's own read. */
++void usb_gamepad_host_direct(int on);
+ const UsbPadSource *usb_gamepad_source(void);
+ 
+ /* With a source: the pads that should be plugged in now -- the source's,
+-- 
+2.55.0.windows.3
+

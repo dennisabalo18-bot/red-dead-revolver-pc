@@ -1,0 +1,252 @@
+From c2e8891150c54e4be46f6b44d79cfb84683d0e85 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 07:31:50 -0300
+Subject: [PATCH 09/47] kernel: real XC_VIDEO flag values, widescreen switch;
+ 16:9 present of 720x480
+
+- kernel.h: XC_VIDEO_FLAGS_* at their EEPROM values (0x00010000 widescreen,
+  ...). The old 0x01/0x02 read as no flag after XGetVideoFlags' >> 16.
+- xbox_VideoWidescreen / Set (RECOMP_WIDESCREEN): XC_VIDEO reports a
+  widescreen TV only when asked.
+- d3d11: a 720x480 frame with widescreen on is presented at 16:9; the
+  window starts 854x480 then.
+- glow skip: any reduced copy laid over a larger target (the scene is
+  drawn into its own target, not the one the copy lands on).
+- F2 menu: native widescreen row in place of the hor+ aspect.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/host_menu.c      | 18 +++++++++++++++---
+ src/d3d/nv2a_pb_d3d11.c  | 37 ++++++++++++++++++++++++++++++-------
+ src/kernel/kernel.h      | 21 ++++++++++++++++-----
+ src/kernel/kernel_xbox.c | 24 +++++++++++++++++++++---
+ 4 files changed, 82 insertions(+), 18 deletions(-)
+
+diff --git a/src/d3d/host_menu.c b/src/d3d/host_menu.c
+index 1a490eb..e0faa39 100644
+--- a/src/d3d/host_menu.c
++++ b/src/d3d/host_menu.c
+@@ -17,6 +17,10 @@
+ 
+ #include "nv2a_backend_common.h"
+ #include "kernel_pacing.h"
++
++/* kernel.h, declared here: it does not mix with <windows.h>. */
++void xbox_VideoWidescreenSet(int on);
++int  xbox_VideoWidescreen(void);
+ #include "input/keyboard.h"
+ #include "input/mouse.h"
+ 
+@@ -41,7 +45,7 @@ static void set_scale(int i)
+ 
+ static const char *const k_aspect[] = { "4:3 (original)", "16:9", "16:10", "21:9", NULL };
+ static const unsigned k_aspect_wh[][2] = { {0, 0}, {16, 9}, {16, 10}, {21, 9} };
+-static int get_aspect(void)
++static int __attribute__((unused)) get_aspect(void)
+ {
+     const struct nv2a_host_opts *o = nv2a_host_opts();
+     int i;
+@@ -50,7 +54,7 @@ static int get_aspect(void)
+             return i;
+     return 0;
+ }
+-static void set_aspect(int i)
++static void __attribute__((unused)) set_aspect(int i)
+ {
+     struct nv2a_host_opts o = *nv2a_host_opts();
+     o.aspect_w = k_aspect_wh[i][0];
+@@ -58,6 +62,14 @@ static void set_aspect(int i)
+     nv2a_host_opts_request(&o, NV2A_OPT_ASPECT);
+ }
+ 
++/* The game's own 16:9: the TV reported widescreen (kernel.h), so the title
++ * picks its 720x480 16:9 mode at boot and widens its 3D and HUD itself. The
++ * hor+ padding (display.aspect, get_aspect) stays out of the menu: on this
++ * title it did nothing visible. */
++static const char *const k_wide[] = { "No (4:3)", "Sí (nativo del juego)", NULL };
++static int get_wide(void) { return xbox_VideoWidescreen() != 0; }
++static void set_wide(int i) { xbox_VideoWidescreenSet(i); }
++
+ static const char *const k_window[] = {
+     "Libre", "640x480", "800x600", "960x720", "1024x768", "1280x720", "1280x960",
+     "1366x768", "1440x1080", "1600x900", "1600x1200", "1920x1080", "2560x1080",
+@@ -138,7 +150,7 @@ static void set_speed(int i) { xbox_SpeedSet(i ? 2u : 1u); }
+ static const xbox_menu_item k_builtin[] = {
+     { NULL, "Gráficos", NULL, NULL, NULL },
+     { "render_scale", "Resolución interna", k_scale, get_scale, set_scale },
+-    { "aspect", "Relación de aspecto", k_aspect, get_aspect, set_aspect },
++    { "widescreen", "Panorámico 16:9 (al reiniciar)", k_wide, get_wide, set_wide },
+     { "window", "Tamaño de ventana", k_window, get_window, set_window },
+     { "fullscreen", "Pantalla completa (F11)", k_onoff, get_full, set_full },
+     { "filter", "Filtro de escalado", k_filter, get_filter, set_filter },
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index e4ab7ce..2845b26 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -597,6 +597,21 @@ static const char s_vs_passthrough_src[] =
+ 
+ static void create_black_texture(void);
+ 
++/* rdr-port: a widescreen TV reported to the title (xbox_VideoWidescreen,
++ * kernel.h): a title that then picks a 720x480 mode draws it anamorphic, for
++ * a 16:9 screen, as on the console. The present shows such a frame at 16:9
++ * (wide_frame) and the window starts 16:9. */
++static int wide_tv(void)
++{
++    extern int xbox_VideoWidescreen(void);
++    return xbox_VideoWidescreen();
++}
++
++static int wide_frame(const RenderTarget *rt)
++{
++    return rt && wide_tv() && rt->w == 720 && rt->h == 480;
++}
++
+ static int init(void)
+ {
+     static int tried;
+@@ -608,7 +623,7 @@ static int init(void)
+     wchar_t title[192];
+     /* display.aspect: a window of the padded frame's shape (854x480 at
+      * 16:9), so the pads are on screen at 1:1. */
+-    RECT r = {0, 0, (LONG)nv2a_host_window_w(640, 480, 1), 480};
++    RECT r = {0, 0, (LONG)(wide_tv() ? 854u : nv2a_host_window_w(640, 480, 1)), 480};
+     int full = nv2a_host_opts()->fullscreen;
+     int internal = nv2a_host_opts()->present_surface == NV2A_PRESENT_SURFACE_INTERNAL;
+     UINT bw = (UINT)r.right, bh = 480;
+@@ -3435,8 +3450,7 @@ static int aspect_flat(const struct nv2a_pb_draw *d, const struct nv2a_pb_vsh *v
+  * frame into a 512x256 target and fans that back over the frame at half
+  * alpha, which left a seam through the screen's centre. A target drawn
+  * from a larger one is marked a copy of it (rt_copy_mark), and a batch
+- * that lays such a copy back over the target it was copied from is
+- * dropped. Targets drawn from textures (the menu's book, the posters) are
++ * that lays such a copy back over a larger target is dropped. Targets drawn from textures (the menu's book, the posters) are
+  * no copy and keep drawing, which a size alone (the first version) could
+  * not tell apart. RECOMP_D3D11_SKIP_RT=WxH turns it on at start for copies
+  * of that size, =1 for any size; the F2 menu flips it live
+@@ -3492,8 +3506,11 @@ static int skip_rt_overlay(const RenderTarget *rt)
+         return 0;
+     for (n = 0; n < 4; n++) {
+         const RenderTarget *src = s_stage_rt[n];
+-        if (src && src != &s_self && src != rt && src->copy_of == rt->offset
+-                && rt->w > src->w
++        /* Any copy laid back over a larger target: the scene is drawn into
++         * its own 640x480 (not the frame) and composited, so the copy's
++         * source is not the target it lands on. */
++        if (src && src != &s_self && src != rt && src->copy_of
++                && rt->w > src->w && rt->h > src->h
+                 && (!s_glow_w || ((int)src->w == s_glow_w && (int)src->h == s_glow_h)))
+             return 1;
+     }
+@@ -4483,6 +4500,12 @@ static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int in
+     hcw = (cw + 2u * rt->pad) * rt->n;
+     hch = ch * rt->n;
+     nv2a_present_crop(hcw, hch, rt->hw, rt->hh, rt->n, rt->pad, overscan, filter, &c);
++    if (wide_frame(rt)) {
++        /* anamorphic 720x480: shown 16:9, scaled smoothly */
++        c.fit_w = (c.fit_h * 16u + 4u) / 9u;
++        if (filter == NV2A_PRESENT_INTEGER)
++            filter = NV2A_PRESENT_LINEAR;
++    }
+     whole = nv2a_present_rect(c.fit_w, c.fit_h, s_back_w, s_back_h, filter, &r);
+     if (overscan && internal) {
+         r.x = r.y = 0;
+@@ -5072,8 +5095,8 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
+          * filter has anything to do: the frame is copied as it is, at
+          * scale > 1 too (the compositor gets the scaled frame whole). */
+         /* A display.overscan crop always blits: a copy shows the edges. */
+-        int blit = !stock && (eo->overscan
+-                || !(same && (eo->present_filter != NV2A_PRESENT_LINEAR || internal)));
++        int blit = wide_frame(s_drawn) || (!stock && (eo->overscan
++                || !(same && (eo->present_filter != NV2A_PRESENT_LINEAR || internal))));
+ #ifdef XBOXRECOMP_ENHANCE
+         /* present.shader: the chain reads the whole frame, so a display.overscan
+          * crop has no place in it. */
+diff --git a/src/kernel/kernel.h b/src/kernel/kernel.h
+index 1c53e6a..b21cc8f 100644
+--- a/src/kernel/kernel.h
++++ b/src/kernel/kernel.h
+@@ -1311,11 +1311,22 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
+ #define XC_PARENTAL_CONTROL       XC_P_CONTROL_GAMES
+ #define XC_PARENTAL_PASSWORD      XC_P_CONTROL_PASSWORD
+ 
+-/* Video standard flags in XC_VIDEO */
+-#define XC_VIDEO_FLAGS_WIDESCREEN   0x01
+-#define XC_VIDEO_FLAGS_HDTV         0x02
+-#define XC_VIDEO_FLAGS_PAL_I        0x04
+-#define XC_VIDEO_FLAGS_LETTERBOX    0x10
++/* Video flags in XC_VIDEO, as the EEPROM holds them: the XDK's
++ * XGetVideoFlags returns (value >> 16) & 0x5F, so the low bits mean nothing.
++ * (These were 0x01 / 0x02 / ..., which a title read as no flag at all.) */
++#define XC_VIDEO_FLAGS_WIDESCREEN   0x00010000
++#define XC_VIDEO_FLAGS_HDTV_720p    0x00020000
++#define XC_VIDEO_FLAGS_HDTV_1080i   0x00040000
++#define XC_VIDEO_FLAGS_HDTV_480p    0x00080000
++#define XC_VIDEO_FLAGS_LETTERBOX    0x00100000
++#define XC_VIDEO_FLAGS_PAL_60Hz     0x00400000
++#define XC_VIDEO_FLAGS_HDTV         XC_VIDEO_FLAGS_HDTV_480p
++
++/* rdr-port: whether XC_VIDEO reports a widescreen TV (default no, which is
++ * what every title saw before the values above were fixed). A title reads it
++ * at boot to pick its video mode. RECOMP_WIDESCREEN=1 turns it on. */
++void xbox_VideoWidescreenSet(int on);
++int  xbox_VideoWidescreen(void);
+ 
+ /* Unknown ordinals - stub */
+ VOID    __stdcall xbox_Unknown_8(void);
+diff --git a/src/kernel/kernel_xbox.c b/src/kernel/kernel_xbox.c
+index afaff4f..c27eecb 100644
+--- a/src/kernel/kernel_xbox.c
++++ b/src/kernel/kernel_xbox.c
+@@ -10,9 +10,27 @@
+  */
+ 
+ #include "kernel.h"
++#include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
+ 
++/* rdr-port: XC_VIDEO's widescreen flag (kernel.h). */
++static int s_widescreen = -1;
++
++void xbox_VideoWidescreenSet(int on)
++{
++    s_widescreen = on != 0;
++}
++
++int xbox_VideoWidescreen(void)
++{
++    if (s_widescreen < 0) {
++        const char *e = getenv("RECOMP_WIDESCREEN");
++        s_widescreen = e && *e == '1';
++    }
++    return s_widescreen;
++}
++
+ /* ============================================================================
+  * Exported Data Objects
+  *
+@@ -222,9 +240,9 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
+         break;
+ 
+     case XC_VIDEO:
+-        /* NTSC with widescreen and HDTV support enabled */
++        /* NTSC; widescreen only when asked (xbox_VideoWidescreen) */
+         if (ValueLength >= sizeof(ULONG)) {
+-            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
++            *(PULONG)Value = xbox_VideoWidescreen() ? XC_VIDEO_FLAGS_WIDESCREEN : 0;
+             if (Type) *Type = 4; /* REG_DWORD */
+             if (ResultLength) *ResultLength = sizeof(ULONG);
+         }
+@@ -315,7 +333,7 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
+         memcpy(blk + 0x28, &s_tz.std_bias, 4);
+         memcpy(blk + 0x2C, &s_tz.dlt_bias, 4);
+         { ULONG v = 1; memcpy(blk + 0x30, &v, 4); }                       /* English */
+-        { ULONG v = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV; memcpy(blk + 0x34, &v, 4); }
++        { ULONG v = xbox_VideoWidescreen() ? XC_VIDEO_FLAGS_WIDESCREEN : 0; memcpy(blk + 0x34, &v, 4); }
+         /* 0x58 is MiscFlags (0); DvdRegion is the last field, at 0x5C. */
+         { ULONG v = 1; memcpy(blk + 0x5C, &v, 4); }                       /* DVD region 1 */
+         if (Type) *Type = 3;
+-- 
+2.55.0.windows.3
+

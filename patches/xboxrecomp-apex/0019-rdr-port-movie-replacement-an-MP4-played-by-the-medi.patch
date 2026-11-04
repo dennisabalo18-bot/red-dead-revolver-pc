@@ -1,0 +1,487 @@
+From e65e4e6dee5a6e922273b445f935d0e3752e236b Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:44:56 -0300
+Subject: [PATCH 19/47] rdr-port: movie replacement: an MP4 played by the media
+ engine on the D3D11 device (nv2a_d3d11_movie)
+
+The title's thread asks and waits; the ack thread, which owns the device,
+plays it at its next poll with the guest paused, letterboxed (3:2 frames
+shown 4:3), until it ends or a skip key. The device is made with video
+support, falling back to none (then no replacement).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/CMakeLists.txt  |   1 +
+ src/d3d/movie_mf.c      | 193 ++++++++++++++++++++++++++++++++++++++++
+ src/d3d/movie_mf.h      |  25 ++++++
+ src/d3d/nv2a_pb_d3d11.c | 190 ++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 408 insertions(+), 1 deletion(-)
+ create mode 100644 src/d3d/movie_mf.c
+ create mode 100644 src/d3d/movie_mf.h
+
+diff --git a/src/d3d/CMakeLists.txt b/src/d3d/CMakeLists.txt
+index be5395b..9c3cea6 100644
+--- a/src/d3d/CMakeLists.txt
++++ b/src/d3d/CMakeLists.txt
+@@ -22,6 +22,7 @@ if(WIN32)
+         d3d8_vsh_msl.c
+         d3d8_combiners_msl.c
+         nv2a_pb_d3d11.c
++        movie_mf.c
+         host_menu.c
+         shader_cache.c
+     )
+diff --git a/src/d3d/movie_mf.c b/src/d3d/movie_mf.c
+new file mode 100644
+index 0000000..d1432cf
+--- /dev/null
++++ b/src/d3d/movie_mf.c
+@@ -0,0 +1,193 @@
++/* rdr-port: Media Foundation's media engine (IMFMediaEngine) in frame-server
++ * mode: it decodes, keeps the sound in time and plays it itself; the caller
++ * asks each pass whether a frame is due and copies it into its texture.
++ * See movie_mf.h. */
++#if defined(_WIN32)
++#define COBJMACROS
++#include <windows.h>
++#include <d3d11.h>
++#include <d3d11_4.h>          /* ID3D11Multithread */
++#include <mfapi.h>
++#include <mfmediaengine.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "movie_mf.h"
++
++#pragma comment(lib, "mfplat.lib")
++#pragma comment(lib, "mfuuid.lib")
++#pragma comment(lib, "oleaut32.lib")
++#pragma comment(lib, "ole32.lib")
++
++#define LOGP "[MOVIE] "
++
++typedef struct {
++    IMFMediaEngineNotify iface;
++    volatile LONG ended, failed;
++} Notify;
++
++struct movie_mf {
++    Notify                notify;
++    IMFMediaEngine       *me;
++    IMFDXGIDeviceManager *mgr;
++    ID3D11Multithread    *mt;
++    BOOL                  mt_was;
++};
++
++static HRESULT STDMETHODCALLTYPE n_qi(IMFMediaEngineNotify *t, REFIID r, void **o)
++{
++    if (IsEqualIID(r, &IID_IUnknown) || IsEqualIID(r, &IID_IMFMediaEngineNotify)) {
++        *o = t;
++        return S_OK;
++    }
++    *o = NULL;
++    return E_NOINTERFACE;
++}
++
++/* The notify lives in the movie_mf, which outlasts the engine. */
++static ULONG STDMETHODCALLTYPE n_ref(IMFMediaEngineNotify *t)
++{
++    (void)t;
++    return 2;
++}
++
++static HRESULT STDMETHODCALLTYPE n_event(IMFMediaEngineNotify *t, DWORD e, DWORD_PTR p1, DWORD p2)
++{
++    Notify *n = (Notify *)t;
++    if (e == MF_MEDIA_ENGINE_EVENT_ENDED)
++        InterlockedExchange(&n->ended, 1);
++    else if (e == MF_MEDIA_ENGINE_EVENT_ERROR) {
++        fprintf(stderr, LOGP "media engine error %u (hr=0x%08lX)\n", (unsigned)p1,
++                (unsigned long)p2);
++        InterlockedExchange(&n->failed, 1);
++    }
++    return S_OK;
++}
++
++static IMFMediaEngineNotifyVtbl s_notify_vtbl = { n_qi, n_ref, n_ref, n_event };
++
++movie_mf *movie_mf_open(ID3D11Device *dev, const wchar_t *path)
++{
++    static int started;
++    IMFMediaEngineClassFactory *f = NULL;
++    IMFAttributes *a = NULL;
++    ID3D11DeviceContext *ctx = NULL;
++    movie_mf *m;
++    UINT token = 0;
++    BSTR url;
++    HRESULT hr;
++
++    if (!started) {
++        hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
++        if (FAILED(hr) && hr != RPC_E_CHANGED_MODE)
++            fprintf(stderr, LOGP "CoInitializeEx hr=0x%08lX\n", (unsigned long)hr);
++        hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
++        if (FAILED(hr)) {
++            fprintf(stderr, LOGP "MFStartup hr=0x%08lX\n", (unsigned long)hr);
++            return NULL;
++        }
++        started = 1;
++    }
++    m = (movie_mf *)calloc(1, sizeof *m);
++    if (!m)
++        return NULL;
++    m->notify.iface.lpVtbl = &s_notify_vtbl;
++    ID3D11Device_GetImmediateContext(dev, &ctx);
++    if (ctx && SUCCEEDED(ID3D11DeviceContext_QueryInterface(ctx, &IID_ID3D11Multithread,
++                                                            (void **)&m->mt)))
++        m->mt_was = ID3D11Multithread_SetMultithreadProtected(m->mt, TRUE);
++    if (ctx)
++        ID3D11DeviceContext_Release(ctx);
++
++    hr = MFCreateDXGIDeviceManager(&token, &m->mgr);
++    if (SUCCEEDED(hr))
++        hr = IMFDXGIDeviceManager_ResetDevice(m->mgr, (IUnknown *)dev, token);
++    if (SUCCEEDED(hr))
++        hr = MFCreateAttributes(&a, 3);
++    if (SUCCEEDED(hr))
++        hr = IMFAttributes_SetUnknown(a, &MF_MEDIA_ENGINE_CALLBACK, (IUnknown *)&m->notify.iface);
++    if (SUCCEEDED(hr))
++        hr = IMFAttributes_SetUnknown(a, &MF_MEDIA_ENGINE_DXGI_MANAGER, (IUnknown *)m->mgr);
++    if (SUCCEEDED(hr))
++        hr = IMFAttributes_SetUINT32(a, &MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT,
++                                     DXGI_FORMAT_B8G8R8A8_UNORM);
++    if (SUCCEEDED(hr))
++        hr = CoCreateInstance(&CLSID_MFMediaEngineClassFactory, NULL, CLSCTX_INPROC_SERVER,
++                              &IID_IMFMediaEngineClassFactory, (void **)&f);
++    if (SUCCEEDED(hr))
++        hr = IMFMediaEngineClassFactory_CreateInstance(f, 0, a, &m->me);
++    if (f)
++        IMFMediaEngineClassFactory_Release(f);
++    if (a)
++        IMFAttributes_Release(a);
++    if (SUCCEEDED(hr)) {
++        url = SysAllocString(path);
++        hr = url ? IMFMediaEngine_SetSource(m->me, url) : E_OUTOFMEMORY;
++        SysFreeString(url);
++    }
++    if (SUCCEEDED(hr))
++        hr = IMFMediaEngine_Play(m->me);
++    if (FAILED(hr)) {
++        fprintf(stderr, LOGP "open %ls: hr=0x%08lX\n", path, (unsigned long)hr);
++        movie_mf_close(m);
++        return NULL;
++    }
++    return m;
++}
++
++int movie_mf_frame(movie_mf *m, UINT *w, UINT *h)
++{
++    LONGLONG pts;
++    DWORD vw = 0, vh = 0;
++
++    if (IMFMediaEngine_OnVideoStreamTick(m->me, &pts) != S_OK)
++        return 0;
++    if (FAILED(IMFMediaEngine_GetNativeVideoSize(m->me, &vw, &vh)) || !vw || !vh)
++        return 0;
++    *w = vw;
++    *h = vh;
++    return 1;
++}
++
++int movie_mf_copy(movie_mf *m, ID3D11Texture2D *tex, UINT w, UINT h)
++{
++    MFVideoNormalizedRect src = {0.0f, 0.0f, 1.0f, 1.0f};
++    RECT dst = {0, 0, (LONG)w, (LONG)h};
++    MFARGB black = {0, 0, 0, 255};
++    return SUCCEEDED(IMFMediaEngine_TransferVideoFrame(m->me, (IUnknown *)tex, &src, &dst,
++                                                       &black));
++}
++
++int movie_mf_done(movie_mf *m)
++{
++    if (m->notify.failed)
++        return -1;
++    return m->notify.ended || IMFMediaEngine_IsEnded(m->me);
++}
++
++void movie_mf_pause(movie_mf *m, int on)
++{
++    if (on)
++        IMFMediaEngine_Pause(m->me);
++    else
++        IMFMediaEngine_Play(m->me);
++}
++
++void movie_mf_close(movie_mf *m)
++{
++    if (!m)
++        return;
++    if (m->me) {
++        IMFMediaEngine_Shutdown(m->me);
++        IMFMediaEngine_Release(m->me);
++    }
++    if (m->mgr)
++        IMFDXGIDeviceManager_Release(m->mgr);
++    if (m->mt) {
++        ID3D11Multithread_SetMultithreadProtected(m->mt, m->mt_was);
++        ID3D11Multithread_Release(m->mt);
++    }
++    free(m);
++}
++
++#endif /* _WIN32 */
+diff --git a/src/d3d/movie_mf.h b/src/d3d/movie_mf.h
+new file mode 100644
+index 0000000..264ccae
+--- /dev/null
++++ b/src/d3d/movie_mf.h
+@@ -0,0 +1,25 @@
++/* rdr-port: a movie file (MP4 or anything else Windows decodes) played by
++ * Media Foundation's media engine onto a D3D11 device, sound included, for
++ * the D3D11 backend's movie replacement (nv2a_d3d11_movie). */
++#ifndef MOVIE_MF_H
++#define MOVIE_MF_H
++
++#include <d3d11.h>
++
++typedef struct movie_mf movie_mf;
++
++/* NULL when the engine cannot be made or the file not opened. dev must
++ * have been made with D3D11_CREATE_DEVICE_VIDEO_SUPPORT; it is multithread
++ * protected while the movie is open (the engine decodes on its own
++ * threads). Playback starts at once. */
++movie_mf *movie_mf_open(ID3D11Device *dev, const wchar_t *path);
++/* 1 and the frame's size when a new frame is due: then movie_mf_copy
++ * writes it into tex (BGRA, render-target bindable, w x h). */
++int  movie_mf_frame(movie_mf *m, UINT *w, UINT *h);
++int  movie_mf_copy(movie_mf *m, ID3D11Texture2D *tex, UINT w, UINT h);
++/* 1 once it has ended; -1 on a decode error. */
++int  movie_mf_done(movie_mf *m);
++void movie_mf_pause(movie_mf *m, int on);
++void movie_mf_close(movie_mf *m);
++
++#endif
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index 45552be..292f21f 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -93,6 +93,7 @@ static UINT                    s_sync_interval;
+ /* rdr-port: the window is in the background (WM_ACTIVATEAPP), and whether the
+  * game pauses then (F2, RECOMP_PAUSE_UNFOCUSED=0 turns it off). */
+ static volatile int            s_unfocused;
++static int                     s_video_ok;   /* device made with video support */
+ static int                     s_pause_focus = -1;
+ static int                     s_vsync_set;   /* the F2 menu chose: init keeps it */
+ static ID3D11Device           *s_dev;
+@@ -715,9 +716,17 @@ static int init(void)
+     sd.OutputWindow = s_hwnd;
+     sd.Windowed = TRUE;
+     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+-    hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
++    /* rdr-port: video support for the movie replacement's media engine
++     * (nv2a_d3d11_movie); a device without it only loses that. */
++    hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
++                                       D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                                        NULL, 0, D3D11_SDK_VERSION, &sd,
+                                        &s_swap, &s_dev, &fl, &s_ctx);
++    s_video_ok = SUCCEEDED(hr);
++    if (FAILED(hr))
++        hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
++                                           NULL, 0, D3D11_SDK_VERSION, &sd,
++                                           &s_swap, &s_dev, &fl, &s_ctx);
+     if (FAILED(hr)) {
+         fprintf(stderr, LOGP "D3D11CreateDeviceAndSwapChain hr=0x%08lX\n",
+                 (unsigned long)hr);
+@@ -5831,10 +5840,189 @@ static int d3d11_on_report(uint32_t va)
+ /* At the end of a walk, before a semaphore release after a report, and
+  * every ack pass (retired queries only, unflushed, when nothing is
+  * pending). */
++/* ── rdr-port: movie replacement ───────────────────────────────────────
++ *
++ * The title's thread asks for a movie file (nv2a_d3d11_movie) and waits;
++ * this thread, the one that owns the device, plays it at its next poll:
++ * the guest paused, the window pumped, every new frame letterboxed into the
++ * back buffer and presented, until the movie ends or a skip key goes down
++ * (Esc, Enter, Space, the left mouse button; A, B or START on a pad). A
++ * 720x480 frame (any 3:2 size) is the console's 4:3 picture; any other
++ * size is shown at its own shape. */
++#include <xinput.h>
++#pragma comment(lib, "xinput.lib")
++#include "movie_mf.h"
++
++static volatile LONG s_movie_state;    /* 0 idle, 1 asked, 2 played, 3 failed */
++static wchar_t s_movie_path[MAX_PATH];
++static HANDLE s_movie_done;
++
++static int movie_skip_down(void)
++{
++    static const int keys[] = {VK_ESCAPE, VK_RETURN, VK_SPACE, VK_LBUTTON};
++    XINPUT_STATE xs;
++    DWORD i;
++    if (GetForegroundWindow() == s_hwnd)
++        for (i = 0; i < sizeof keys / sizeof keys[0]; i++)
++            if (GetAsyncKeyState(keys[i]) & 0x8000)
++                return 1;
++    for (i = 0; i < XUSER_MAX_COUNT; i++)
++        if (XInputGetState(i, &xs) == ERROR_SUCCESS
++                && (xs.Gamepad.wButtons & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B
++                                           | XINPUT_GAMEPAD_START)))
++            return 1;
++    return 0;
++}
++
++static void movie_draw(ID3D11ShaderResourceView *srv, UINT w, UINT h)
++{
++    static const float black[4] = {0, 0, 0, 1};
++    static const float uv[4] = {1.0f, 1.0f, 0.0f, 0.0f};
++    ID3D11ShaderResourceView *none = NULL;
++    D3D11_MAPPED_SUBRESOURCE m;
++    D3D11_VIEWPORT vp;
++    float aspect = w * 2u == h * 3u ? 4.0f / 3.0f : (float)w / (float)h;
++
++    if (!s_back || !blit_init())
++        return;
++    if (!s_back_rtv && FAILED(ID3D11Device_CreateRenderTargetView(
++                s_dev, (ID3D11Resource *)s_back, NULL, &s_back_rtv)))
++        return;
++    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
++                                       D3D11_MAP_WRITE_DISCARD, 0, &m)))
++        return;
++    memcpy(m.pData, uv, sizeof uv);
++    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_blit_cb, 0);
++    vp.Height = (float)s_back_h;
++    vp.Width = vp.Height * aspect;
++    if (vp.Width > (float)s_back_w) {
++        vp.Width = (float)s_back_w;
++        vp.Height = vp.Width / aspect;
++    }
++    vp.TopLeftX = ((float)s_back_w - vp.Width) * 0.5f;
++    vp.TopLeftY = ((float)s_back_h - vp.Height) * 0.5f;
++    vp.MinDepth = 0.0f;
++    vp.MaxDepth = 1.0f;
++    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back_rtv, NULL);
++    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
++    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
++    ID3D11DeviceContext_RSSetState(s_ctx, s_rs[0][0]);
++    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFF);
++    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_off, 0);
++    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
++    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
++    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_blit_cb);
++    ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps, NULL, 0);
++    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &srv);
++    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp[1]);
++    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
++    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
++    s_sc_init = 0;
++}
++
++/* 1 when the movie played (to its end or a skip), 0 when it could not
++ * start: the title then plays its own. */
++static int movie_run(const wchar_t *path)
++{
++    ID3D11Texture2D *tex = NULL;
++    ID3D11ShaderResourceView *srv = NULL;
++    UINT tw = 0, th = 0, w, h;
++    int frames = 0, armed = 0, done = 0;
++    ULONGLONG t0 = GetTickCount64();
++    movie_mf *m;
++
++    if (!s_video_ok)
++        return 0;
++    m = movie_mf_open(s_dev, path);
++    if (!m)
++        return 0;
++    xbox_PauseSet(1);
++    fprintf(stderr, LOGP "movie %ls\n", path);
++    while (!done) {
++        pump();
++        if (s_unfocused && nv2a_d3d11_pause_focus(-1)) {
++            movie_mf_pause(m, 1);
++            while (s_unfocused && nv2a_d3d11_pause_focus(-1)) {
++                Sleep(15);
++                pump();
++            }
++            movie_mf_pause(m, 0);
++        }
++        present_resize();
++        if (!movie_skip_down())
++            armed = 1;               /* a key held from before is no skip */
++        else if (armed)
++            break;
++        done = movie_mf_done(m);
++        if (done < 0 || (!frames && GetTickCount64() - t0 > 10000))
++            break;
++        if (!movie_mf_frame(m, &w, &h)) {
++            Sleep(1);
++            continue;
++        }
++        if (!tex || w != tw || h != th) {
++            D3D11_TEXTURE2D_DESC td;
++            if (srv) ID3D11ShaderResourceView_Release(srv);
++            if (tex) ID3D11Texture2D_Release(tex);
++            srv = NULL;
++            memset(&td, 0, sizeof td);
++            td.Width = w;
++            td.Height = h;
++            td.MipLevels = 1;
++            td.ArraySize = 1;
++            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++            td.SampleDesc.Count = 1;
++            td.Usage = D3D11_USAGE_DEFAULT;
++            td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
++            if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &tex))
++                    || FAILED(ID3D11Device_CreateShaderResourceView(
++                           s_dev, (ID3D11Resource *)tex, NULL, &srv)))
++                break;
++            tw = w;
++            th = h;
++            fprintf(stderr, LOGP "%ux%u\n", w, h);
++        }
++        if (!movie_mf_copy(m, tex, w, h))
++            continue;
++        movie_draw(srv, w, h);
++        IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
++        frames++;
++    }
++    movie_mf_close(m);
++    if (srv) ID3D11ShaderResourceView_Release(srv);
++    if (tex) ID3D11Texture2D_Release(tex);
++    xbox_InputKeysClear();           /* the skip key is not the game's */
++    xbox_PauseSet(0);
++    fprintf(stderr, LOGP "movie %s after %d frames\n",
++            done > 0 ? "ended" : frames ? "skipped" : "failed", frames);
++    return frames > 0;
++}
++
++/* The title's thread: 1 when path played here, 0 when it could not be
++ * (no D3D11 device yet, none with video support, or the file would not
++ * open). Blocks until the movie is over. */
++int nv2a_d3d11_movie(const char *path)
++{
++    if (!s_dev || !s_video_ok)
++        return 0;
++    if (!s_movie_done && !(s_movie_done = CreateEventA(NULL, FALSE, FALSE, NULL)))
++        return 0;
++    if (!MultiByteToWideChar(CP_ACP, 0, path, -1, s_movie_path, MAX_PATH))
++        return 0;
++    InterlockedExchange(&s_movie_state, 1);
++    WaitForSingleObject(s_movie_done, INFINITE);
++    return InterlockedExchange(&s_movie_state, 0) == 2;
++}
++
+ static void d3d11_on_poll(void)
+ {
+     if ((s_occ.npend || s_occ.nret) && s_dev)
+         nv2a_occ_settle(&s_occ);
++    if (s_movie_state == 1) {
++        InterlockedExchange(&s_movie_state, movie_run(s_movie_path) ? 2 : 3);
++        SetEvent(s_movie_done);
++    }
+ }
+ 
+ static const struct nv2a_pb_backend s_d3d11_backend = {
+-- 
+2.55.0.windows.3
+

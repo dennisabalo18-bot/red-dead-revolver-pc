@@ -1,0 +1,70 @@
+From 711247c80b1ec6cba0a54cf76c387051636343d0 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 02:15:50 -0300
+Subject: [PATCH 43/47] d3d11 tex dump: P8 textures too (font pages, text
+ images), once per indices; p8_indices.txt maps palette key to indices key
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/nv2a_pb_d3d11.c | 25 ++++++++++++++++++++-----
+ 1 file changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index af527fa..82082ff 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -2117,6 +2117,8 @@ static int png_write(const char *path, const uint32_t *px, uint32_t w, uint32_t
+     return 1;
+ }
+ 
++static uint64_t s_idx_hash;    /* a P8's texel hash without its palette */
++
+ /* s_texels' level 0 of t, under the pack key `hash`. */
+ static void tex_dump(const Stage *t, uint64_t hash)
+ {
+@@ -2124,13 +2126,17 @@ static void tex_dump(const Stage *t, uint64_t hash)
+     char path[640];
+     unsigned i;
+ 
+-    if (!tex_dump_on() || !nv2a_tex_size_from_format(t->color) || t->color == NV2A_TEX_P8
++    /* rdr-port: P8 too (font pages, text images), once per indices: a text
++     * fading in or out is the same page under many palettes. */
++    uint64_t once = t->color == NV2A_TEX_P8 && s_idx_hash ? s_idx_hash : hash;
++
++    if (!tex_dump_on() || !nv2a_tex_size_from_format(t->color)
+             || !hash || s_dumped_n >= 8192 * 3 / 4)
+         return;
+-    for (i = (unsigned)(hash * 0x9E3779B97F4A7C15ull >> 51); s_dumped[i]; i = (i + 1) & 8191)
+-        if (s_dumped[i] == hash)
++    for (i = (unsigned)(once * 0x9E3779B97F4A7C15ull >> 51); s_dumped[i]; i = (i + 1) & 8191)
++        if (s_dumped[i] == once)
+             return;
+-    s_dumped[i] = hash;
++    s_dumped[i] = once;
+     s_dumped_n++;
+     if (!dir[0]) {
+         const char *e = getenv("RECOMP_TEXTURES_DUMP_DIR");
+@@ -2152,10 +2158,19 @@ static void tex_dump(const Stage *t, uint64_t hash)
+         static unsigned said;
+         if (said++ < 3)
+             fprintf(stderr, LOGP "texture dump: %s\n", path);
++        if (t->color == NV2A_TEX_P8 && s_idx_hash) {
++            /* the pack key of its indices alone (texturas_pack.py) */
++            FILE *f;
++            snprintf(path, sizeof path, "%s\\p8_indices.txt", dir);
++            if ((f = fopen(path, "a")) != NULL) {
++                fprintf(f, "%016llX %016llX %ux%u\n", (unsigned long long)hash,
++                        (unsigned long long)s_idx_hash, t->width, t->height);
++                fclose(f);
++            }
++        }
+     }
+ }
+ 
+-static uint64_t s_idx_hash;
+ static const uint8_t *s_idx_pal;
+ 
+ /* rdr-port: a font page the game drew with a palette of its own (a text
+-- 
+2.55.0.windows.3
+

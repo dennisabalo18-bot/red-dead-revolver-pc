@@ -1,0 +1,70 @@
+From 9f1d4b7e1e13dc207355ff59e3c842c5768942bc Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 15:21:10 -0300
+Subject: [PATCH 27/47] Render scale: move only vertices on a pixel centre
+ (whole-pixel edges left a host row/column uncovered: the menu book's border)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/d3d8_vsh_hlsl.c |  2 ++
+ src/d3d/nv2a_pb_d3d11.c | 24 ++++++++++++------------
+ 2 files changed, 14 insertions(+), 12 deletions(-)
+
+diff --git a/src/d3d/d3d8_vsh_hlsl.c b/src/d3d/d3d8_vsh_hlsl.c
+index eb17609..0199125 100644
+--- a/src/d3d/d3d8_vsh_hlsl.c
++++ b/src/d3d/d3d8_vsh_hlsl.c
+@@ -460,6 +460,8 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
+          * 0.53125 offset moves full-screen passes one pixel. */
+         sb_append(&sb,
+             "    oPos.xy = trunc(oPos.xy * 16.0) / 16.0;\n"
++            /* rdr-port: render scale n, edges on a pixel's centre (set_vp). */
++            "    oPos.xy += (frac(oPos.xy) == 0.5) ? vp_off.w : 0.0;\n"
+             "    float  pw = (oPos.w == 0.0) ? 1.0 : oPos.w;\n"
+             "    o.oPos = float4((oPos.xy * vp_scale.xy + vp_off.xy) * pw,\n"
+             "                    oPos.z * vp_scale.z * pw, pw);\n"
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index c9b8d93..067529e 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -610,7 +610,9 @@ static const char s_vs_passthrough_src[] =
+     VS_OUT_DECL
+     "VS_OUT main(VS_IN i) {\n"
+     "    VS_OUT o = (VS_OUT)0;\n"
+-    "    o.oPos = float4((trunc(i.v0.xy * 16.0) / 16.0) * vp_scale.xy + vp_off.xy,\n"
++    "    float2 p = trunc(i.v0.xy * 16.0) / 16.0;\n"
++    "    p += (frac(p) == 0.5) ? vp_off.w : 0.0;\n"
++    "    o.oPos = float4(p * vp_scale.xy + vp_off.xy,\n"
+     "                    saturate(i.v0.z * vp_scale.z), 1.0);\n"
+     "    o.oD0 = i.v3; o.oD1 = i.v4; o.oFog = 1.0;\n"
+     "    o.oT0 = i.v9; o.oT1 = i.v10; o.oT2 = i.v11; o.oT3 = i.v12;\n"
+@@ -3817,17 +3819,15 @@ static void set_vp(const struct nv2a_pb_vsh *v, const struct nv2a_pb_gpu *g,
+ 
+     nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, rt->pad, &vc);
+     nv2a_aspect_map(&vc, rt->w, rt->h, rt->pad, place);
+-    /* rdr-port: at render scale n, the guest's edge on a pixel's centre
+-     * (x.5: the letterbox bars, the 2D quads) lands n/2 host pixels inside
+-     * that pixel's block and leaves its first host row or column uncovered:
+-     * a dotted line of the scene above the top bar and below the bottom
+-     * one. Shifting by (n-1)/2 host pixels maps the guest's pixel centres
+-     * onto the centres of their blocks, as at 1x. */
+-    if (rt->n > 1) {
+-        float d = -0.5f * (float)(rt->n - 1) / (float)rt->n;   /* guest pixels */
+-        vc.c[4] += vc.c[0] * d;
+-        vc.c[5] += vc.c[1] * d;
+-    }
++    /* rdr-port: at render scale n, a guest edge on a pixel's centre (x.5:
++     * the letterbox bars, the 2D quads) lands n/2 host pixels inside that
++     * pixel's block and leaves its first host row or column uncovered: a
++     * dotted line of the scene above the top bar and below the bottom one.
++     * The shaders move only such vertices, by (n-1)/2 host pixels (vp_off.w,
++     * in guest pixels). Moving every vertex left a host column and row
++     * uncovered at whole-pixel edges instead: the right and bottom border of
++     * the menu's book, a 512x256 target filled edge to edge. */
++    vc.c[7] = rt->n > 1 ? -0.5f * (float)(rt->n - 1) / (float)rt->n : 0.0f;
+     /* Screen positions on an anti-aliased surface are in its clip's units:
+      * x and y reach the surface's pixels times the factor (nv2a_aa_x). */
+     vc.c[0] *= (float)nv2a_aa_x(g->format);
+-- 
+2.55.0.windows.3
+

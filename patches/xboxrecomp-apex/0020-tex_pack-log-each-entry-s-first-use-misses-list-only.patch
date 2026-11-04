@@ -1,0 +1,41 @@
+From af0e839326f1afe3155f1f0e1ccd15dd36ae218c Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:31:44 -0300
+Subject: [PATCH 20/47] tex_pack: log each entry's first use; misses list only
+ what a pack can hold
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/nv2a_tex_pack.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/kernel/nv2a_tex_pack.c b/src/kernel/nv2a_tex_pack.c
+index fab9ac2..b0258f2 100644
+--- a/src/kernel/nv2a_tex_pack.c
++++ b/src/kernel/nv2a_tex_pack.c
+@@ -374,6 +374,12 @@ const uint32_t *nv2a_tex_pack_texels(struct nv2a_tex_pack_entry *e)
+         return NULL;
+     }
+     fclose(f);
++    {   /* Each entry's first use, so a run's log says what the pack replaced. */
++        static unsigned said;
++        if (said++ < 400)
++            fprintf(stderr, "[TEXPACK] hit %016llX %ux%u kind %u\n",
++                    (unsigned long long)e->hash, e->width, e->height, e->kind);
++    }
+ #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+     if (!e->bc3) {  /* BC3 blocks are bytes in GPU order: never swapped */
+         size_t i;
+@@ -534,7 +540,8 @@ void nv2a_tex_pack_print_misses(void)
+     unsigned n = nv2a_tex_pack_misses(m, NV2A_TEX_PACK_MISSES), i;
+     char buf[16];
+     for (i = 0; i < n; i++)
+-        fprintf(stderr, "[TEXPACK] miss %016llX %ux%u %s x%u %s%s\n",
++        if (m[i].candidate)     /* a linear one (a movie frame) the pack cannot hold */
++            fprintf(stderr, "[TEXPACK] miss %016llX %ux%u %s x%u %s%s\n",
+                 (unsigned long long)m[i].hash, m[i].width, m[i].height,
+                 fmt_name(m[i].color, buf, sizeof buf), m[i].count,
+                 m[i].candidate ? "candidate" : "linear/mip", why_name(&m[i]));
+-- 
+2.55.0.windows.3
+

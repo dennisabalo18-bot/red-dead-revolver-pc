@@ -1,0 +1,4 @@
+[
+ {"start": "0x0018D22C", "note": "CRT x87 special-case dispatch (table 0x00415684): fstp; fstp; fldz; ret"},
+ {"start": "0x0018D2CE", "note": "CRT x87 special-case dispatch (table 0x00415684): fstp; fstp; fld [0x415720]"}
+]

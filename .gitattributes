@@ -1,0 +1,4 @@
+# Patches must keep their line endings byte for byte, or `git am` rejects them.
+*.patch -text
+# Windows batch files run as CRLF.
+*.bat text eol=crlf

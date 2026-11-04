@@ -1,0 +1,45 @@
+From b827c22caa187cde9ac1514706ba65537a156cf5 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:26:53 -0300
+Subject: [PATCH 15/47] kernel: RECOMP_MODS_DIR, a file there stands in for the
+ disc's under the same path
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/kernel_path.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
+index 9c8f99a..6dc03c8 100644
+--- a/src/kernel/kernel_path.c
++++ b/src/kernel/kernel_path.c
+@@ -713,6 +713,26 @@ translate:
+             CreateDirectoryW(dir_path, NULL);
+         } else {
+             swprintf_s(host_path_buf, buf_size, L"%s\\%s", base_dir, remainder_wide);
++            /* RECOMP_MODS_DIR: a file there under the same path stands in for
++             * the disc's (a rebuilt archive), the game dir left untouched. */
++            if (base_dir == s_game_dir && remainder_wide[0]) {
++                static WCHAR mods[MAX_PATH];
++                static int mods_read;
++                WCHAR alt[MAX_PATH];
++                DWORD a;
++                if (!mods_read) {
++                    const char *e = getenv("RECOMP_MODS_DIR");
++                    mods_read = 1;
++                    if (e && *e)
++                        MultiByteToWideChar(CP_UTF8, 0, e, -1, mods, MAX_PATH);
++                }
++                if (mods[0] && swprintf_s(alt, MAX_PATH, L"%s\\%s", mods, remainder_wide) > 0
++                        && (a = GetFileAttributesW(alt)) != INVALID_FILE_ATTRIBUTES
++                        && !(a & FILE_ATTRIBUTE_DIRECTORY)) {
++                    fprintf(stderr, "  [PATH] mod: %S\n", alt);
++                    wcscpy_s(host_path_buf, buf_size, alt);
++                }
++            }
+         }
+ 
+         /* An empty remainder means the title opened the device itself, so
+-- 
+2.55.0.windows.3
+

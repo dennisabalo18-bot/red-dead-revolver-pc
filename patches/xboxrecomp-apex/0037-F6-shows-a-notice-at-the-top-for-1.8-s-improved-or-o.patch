@@ -1,0 +1,174 @@
+From f7c2bb24ed0d8bc01a525dc23314dd5c0f167028 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 01:10:21 -0300
+Subject: [PATCH 37/47] F6 shows a notice at the top for 1.8 s: improved or
+ original textures (xbox_MenuToast)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/host_menu.c     | 69 +++++++++++++++++++++++++++++++++++++++--
+ src/d3d/host_menu.h     |  3 ++
+ src/d3d/nv2a_pb_d3d11.c |  6 +++-
+ 3 files changed, 75 insertions(+), 3 deletions(-)
+
+diff --git a/src/d3d/host_menu.c b/src/d3d/host_menu.c
+index e5d0c6f..333a03d 100644
+--- a/src/d3d/host_menu.c
++++ b/src/d3d/host_menu.c
+@@ -327,6 +327,8 @@ static uint32_t *s_px;
+ static unsigned s_w, s_h, s_gen;
+ static HFONT    s_font, s_font_big, s_font_small;
+ static unsigned s_font_px, s_sig;
++/* What the surface holds now: 0 the menu, 1 the FPS box, 2 a notice. */
++static int      s_owner;
+ 
+ static void text(int x, int y, int w, int h, const char *utf8, UINT fmt, COLORREF col)
+ {
+@@ -433,7 +435,8 @@ static const uint32_t *fps_pixels(unsigned back_h, unsigned *w, unsigned *h, uns
+     if (fpx > 40u) fpx = 40u;
+     /* Fast-forward on (Ctrl+F8) says so: x2 doubles the frames too. */
+     H = fpx * 3u / 2u;
+-    if (s_px && fps == shown && speed == shown_speed && fpx == s_font_px && H == s_h)
++    if (s_px && s_owner == 1 && fps == shown && speed == shown_speed && fpx == s_font_px
++            && H == s_h)
+         goto out;
+     if (speed > 1)
+         snprintf(v, sizeof v, "%u FPS   x%u (Ctrl+F8)", fps, speed);
+@@ -451,6 +454,7 @@ static const uint32_t *fps_pixels(unsigned back_h, unsigned *w, unsigned *h, uns
+         return NULL;
+     shown = fps;
+     shown_speed = speed;
++    s_owner = 1;
+     s_sig = 0;                              /* the menu redraws when it opens */
+     fill(0, 0, (int)W, (int)H, RGB(18, 14, 12));
+     SelectObject(s_dc, s_font_big);
+@@ -467,6 +471,58 @@ out:
+     return s_px;
+ }
+ 
++/* A short notice at the top of the screen (xbox_MenuToast): its text and
++ * when it goes, in GetTickCount64 milliseconds. */
++static char      s_toast[96];
++static ULONGLONG s_toast_until;
++
++void xbox_MenuToast(const char *utf8, unsigned ms)
++{
++    snprintf(s_toast, sizeof s_toast, "%s", utf8);
++    s_toast_until = GetTickCount64() + ms;
++    s_sig = 0;
++}
++
++static const uint32_t *toast_pixels(unsigned back_h, unsigned *w, unsigned *h, unsigned *gen)
++{
++    static char shown[96];
++    static unsigned shown_px;
++    unsigned fpx, W, H;
++    SIZE sz;
++    int i;
++
++    fpx = back_h / 30u;
++    if (fpx < 14u) fpx = 14u;
++    if (fpx > 48u) fpx = 48u;
++    if (s_px && s_owner == 2 && fpx == shown_px && !strcmp(shown, s_toast))
++        goto out;
++    if (!make_fonts(fpx))
++        return NULL;
++    SelectObject(s_dc, s_font_big);
++    W = GetTextExtentPoint32A(s_dc, s_toast, (int)strlen(s_toast), &sz) ? (unsigned)sz.cx : fpx * 20u;
++    W += fpx * 2u;
++    H = fpx * 2u;
++    if (!make_surface(W, H, fpx))
++        return NULL;
++    snprintf(shown, sizeof shown, "%s", s_toast);
++    shown_px = fpx;
++    s_owner = 2;
++    s_sig = 0;                              /* the menu redraws when it opens */
++    fill(0, 0, (int)W, (int)H, RGB(18, 14, 12));
++    fill(0, (int)H - (int)(fpx / 8u + 1u), (int)W, (int)(fpx / 8u + 1u), RGB(200, 160, 90));
++    SelectObject(s_dc, s_font_big);
++    text(0, 0, (int)W, (int)H, s_toast, DT_CENTER, RGB(240, 220, 170));
++    GdiFlush();
++    for (i = 0; i < (int)(W * H); i++)
++        s_px[i] = (s_px[i] & 0x00FFFFFFu) | 0xD8000000u;
++    s_gen++;
++out:
++    *w = s_w;
++    *h = s_h;
++    *gen = s_gen;
++    return s_px;
++}
++
+ const uint32_t *xbox_MenuPixels(unsigned back_h, unsigned *w, unsigned *h, unsigned *gen,
+                                 int *corner)
+ {
+@@ -474,6 +530,14 @@ const uint32_t *xbox_MenuPixels(unsigned back_h, unsigned *w, unsigned *h, unsig
+     int i, y;
+ 
+     *corner = 0;
++    if (!s_open && s_toast_until) {
++        if (GetTickCount64() < s_toast_until) {
++            *corner = 2;
++            return toast_pixels(back_h, w, h, gen);
++        }
++        s_toast_until = 0;
++        s_sig = 0;
++    }
+     if (!s_open) {
+         if (!s_fps_on)
+             return NULL;
+@@ -493,11 +557,12 @@ const uint32_t *xbox_MenuPixels(unsigned back_h, unsigned *w, unsigned *h, unsig
+     sig = (sig ^ (unsigned)s_sel) * 16777619u;
+     for (i = 0; i < s_n; i++)
+         sig = (sig ^ (unsigned)(s_items[i]->choices ? s_items[i]->get() + 1 : 0)) * 16777619u;
+-    if (s_px && sig == s_sig && W == s_w && H == s_h)
++    if (s_px && s_owner == 0 && sig == s_sig && W == s_w && H == s_h)
+         goto out;
+     if (!make_surface(W, H, fpx))
+         return NULL;
+     s_sig = sig;
++    s_owner = 0;
+ 
+     fill(0, 0, (int)W, (int)H, RGB(18, 14, 12));
+     fill(0, 0, (int)W, 3, RGB(170, 70, 40));
+diff --git a/src/d3d/host_menu.h b/src/d3d/host_menu.h
+index 7dc2e43..56ae491 100644
+--- a/src/d3d/host_menu.h
++++ b/src/d3d/host_menu.h
+@@ -43,6 +43,9 @@ int  xbox_MenuKey(int vk, int down, int repeat);
+  * is on (*corner = 1: top left, not centred), else NULL. */
+ const uint32_t *xbox_MenuPixels(unsigned back_h, unsigned *w, unsigned *h, unsigned *gen,
+                                 int *corner);
++/* A notice centred at the top for ms milliseconds while the menu is closed
++ * (*corner = 2 from xbox_MenuPixels), e.g. F6's "Texturas mejoradas". */
++void xbox_MenuToast(const char *utf8, unsigned ms);
+ 
+ /* nv2a_pb_d3d11.c: resize the window's client area at the next flip. */
+ void nv2a_d3d11_window_request(unsigned w, unsigned h);
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index 11659ad..428f9f7 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -363,6 +363,8 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+             int on = !nv2a_tex_pack_kind_enabled(XRTP_KIND_ART);
+             nv2a_tex_pack_set_kind_enabled(XRTP_KIND_ART, on);
+             nv2a_tex_pack_set_kind_enabled(XRTP_KIND_FONT, on);
++            xbox_MenuToast(on ? "Texturas mejoradas (modernas)" : "Texturas originales (antiguas)",
++                           1800);
+             return 0;
+         }
+         /* Ctrl+F8: game speed x1 -> x2 -> x4 -> x1 (kernel_pacing.h). F8 alone
+@@ -4847,8 +4849,10 @@ static void menu_present(void)
+     vp.Height = (float)h * k;
+     vp.TopLeftX = ((float)s_back_w - vp.Width) * 0.5f;
+     vp.TopLeftY = ((float)s_back_h - vp.Height) * 0.5f;
+-    if (corner)                             /* the FPS box */
++    if (corner == 1)                        /* the FPS box */
+         vp.TopLeftX = vp.TopLeftY = (float)(s_back_h / 60u);
++    else if (corner == 2)                   /* a notice: top, centred */
++        vp.TopLeftY = (float)(s_back_h / 12u);
+     vp.MinDepth = 0.0f;
+     vp.MaxDepth = 1.0f;
+     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back_rtv, NULL);
+-- 
+2.55.0.windows.3
+

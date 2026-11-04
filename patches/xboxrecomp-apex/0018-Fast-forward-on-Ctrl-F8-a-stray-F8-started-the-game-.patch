@@ -1,0 +1,113 @@
+From 7036a45fdeba69afcc6e4cf537460a12ff3a318e Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 18:31:11 -0300
+Subject: [PATCH 18/47] Fast-forward on Ctrl+F8 (a stray F8 started the game at
+ x2); FPS box as wide as its text
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/host_menu.c     | 39 +++++++++++++++++++++++++++------------
+ src/d3d/nv2a_pb_d3d11.c |  6 ++++--
+ 2 files changed, 31 insertions(+), 14 deletions(-)
+
+diff --git a/src/d3d/host_menu.c b/src/d3d/host_menu.c
+index 22f2a25..787e2c4 100644
+--- a/src/d3d/host_menu.c
++++ b/src/d3d/host_menu.c
+@@ -169,7 +169,7 @@ static int s_fps_on;
+ static int get_fps(void) { return s_fps_on; }
+ static void set_fps(int i) { s_fps_on = i; }
+ 
+-static const char *const k_speed[] = { "x1", "x2 (F8)", NULL };
++static const char *const k_speed[] = { "x1", "x2 (Ctrl+F8)", NULL };
+ static int get_speed(void) { return xbox_Speed() > 1; }
+ static void set_speed(int i) { xbox_SpeedSet(i ? 2u : 1u); }
+ 
+@@ -390,11 +390,9 @@ static HFONT font(int px, int weight)
+                        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+ }
+ 
+-static int make_surface(unsigned w, unsigned h, unsigned fpx)
++/* The DC and the three fonts at fpx pixels; 0 when GDI failed. */
++static int make_fonts(unsigned fpx)
+ {
+-    BITMAPINFO bi;
+-    void *bits = NULL;
+-
+     if (!s_dc && !(s_dc = CreateCompatibleDC(NULL)))
+         return 0;
+     if (fpx != s_font_px) {
+@@ -406,6 +404,16 @@ static int make_surface(unsigned w, unsigned h, unsigned fpx)
+         s_font_small = font((int)(fpx * 8 / 10), FW_SEMIBOLD);
+         s_font_px = fpx;
+     }
++    return 1;
++}
++
++static int make_surface(unsigned w, unsigned h, unsigned fpx)
++{
++    BITMAPINFO bi;
++    void *bits = NULL;
++
++    if (!make_fonts(fpx))
++        return 0;
+     if (s_bmp && w == s_w && h == s_h)
+         return 1;
+     if (s_bmp)
+@@ -453,11 +461,22 @@ static const uint32_t *fps_pixels(unsigned back_h, unsigned *w, unsigned *h, uns
+     fpx = back_h / 40u;
+     if (fpx < 13u) fpx = 13u;
+     if (fpx > 40u) fpx = 40u;
+-    /* Fast-forward on (F8) says so: x2 doubles the frames too. */
+-    W = fpx * (speed > 1 ? 15u : 9u) / 2u;
++    /* Fast-forward on (Ctrl+F8) says so: x2 doubles the frames too. */
+     H = fpx * 3u / 2u;
+-    if (s_px && fps == shown && speed == shown_speed && W == s_w && H == s_h)
++    if (s_px && fps == shown && speed == shown_speed && fpx == s_font_px && H == s_h)
+         goto out;
++    if (speed > 1)
++        snprintf(v, sizeof v, "%u FPS   x%u (Ctrl+F8)", fps, speed);
++    else
++        snprintf(v, sizeof v, "%u FPS", fps);
++    {
++        /* As wide as the text, measured in the font it is drawn in. */
++        SIZE sz;
++        if (!make_fonts(fpx))
++            return NULL;
++        SelectObject(s_dc, s_font_big);
++        W = GetTextExtentPoint32A(s_dc, v, (int)strlen(v), &sz) ? (unsigned)sz.cx + fpx : fpx * 16u;
++    }
+     if (!make_surface(W, H, fpx))
+         return NULL;
+     shown = fps;
+@@ -465,10 +484,6 @@ static const uint32_t *fps_pixels(unsigned back_h, unsigned *w, unsigned *h, uns
+     s_sig = 0;                              /* the menu redraws when it opens */
+     fill(0, 0, (int)W, (int)H, RGB(18, 14, 12));
+     SelectObject(s_dc, s_font_big);
+-    if (speed > 1)
+-        snprintf(v, sizeof v, "%u FPS  x%u (F8)", fps, speed);
+-    else
+-        snprintf(v, sizeof v, "%u FPS", fps);
+     text(0, 0, (int)W, (int)H, v, DT_CENTER,
+          fps >= 55 ? RGB(150, 220, 120) : fps >= 30 ? RGB(235, 195, 125) : RGB(235, 110, 90));
+     GdiFlush();
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index 74fa5f3..45552be 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -355,8 +355,10 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+             nv2a_pb_mlog_request();
+             return 0;
+         }
+-        /* F8: game speed x2 on, off again (kernel_pacing.h). */
+-        if (w == VK_F8) {
++        /* Ctrl+F8: game speed x2 on, off again (kernel_pacing.h). F8 alone
++         * reached the window by itself (a hotkey of another program) and
++         * left the game running at x2 from the title screen. */
++        if (w == VK_F8 && (GetKeyState(VK_CONTROL) & 0x8000)) {
+             extern unsigned xbox_Speed(void);
+             extern void xbox_SpeedSet(unsigned speed);
+             xbox_SpeedSet(xbox_Speed() > 1 ? 1u : 2u);
+-- 
+2.55.0.windows.3
+

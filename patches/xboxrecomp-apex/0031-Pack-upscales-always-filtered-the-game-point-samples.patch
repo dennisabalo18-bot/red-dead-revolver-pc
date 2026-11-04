@@ -1,0 +1,31 @@
+From 6c3bcf360e31310b2cdf595461af9c2894a7e9f5 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 16:00:02 -0300
+Subject: [PATCH 31/47] Pack upscales always filtered (the game point-samples
+ its font pages; a 4x page came out stair-stepped)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/nv2a_pb_d3d11.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index b7c1af6..b743d83 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -2369,6 +2369,12 @@ static ID3D11SamplerState *sampler(const Stage *t, int bump_source, unsigned pk)
+         point = recomp_env(RENV_D3D11_POINT) != NULL;
+     mn = !point && filter_linear(t->filter, 0);
+     mg = !point && filter_linear(t->filter, 1);
++    /* rdr-port: an upscale is filtered even where the guest asked for point
++     * sampling. The game samples its font pages point, which at 1x is the
++     * texel itself; a 4x page shrunk on screen point-sampled came out with
++     * stair-stepped edges ("Cargando partida", "Presionar START"). */
++    if (pk && !point)
++        mn = mg = 1;
+     mip = t->levels > 1 ? filter_mip(t->filter) : 0;
+     if ((pk & 0x10u) && !mip && mn)
+         mip = 2;    /* an upscale with mips over a texture without: blend levels */
+-- 
+2.55.0.windows.3
+

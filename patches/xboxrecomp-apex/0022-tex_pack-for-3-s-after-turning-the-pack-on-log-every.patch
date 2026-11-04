@@ -1,0 +1,83 @@
+From 997aedbb89131ed493e330041715449899c10f0a Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:55:08 -0300
+Subject: [PATCH 22/47] tex_pack: for 3 s after turning the pack on, log every
+ entry found (what the screen draws)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/nv2a_tex_pack.c | 36 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/src/kernel/nv2a_tex_pack.c b/src/kernel/nv2a_tex_pack.c
+index b0258f2..d76c652 100644
+--- a/src/kernel/nv2a_tex_pack.c
++++ b/src/kernel/nv2a_tex_pack.c
+@@ -8,6 +8,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <time.h>
+ 
+ #ifdef _WIN32
+ #define pack_seek(f, off) _fseeki64((f), (long long)(off), SEEK_SET)
+@@ -32,6 +33,20 @@ static uint64_t  s_hits;
+ static atomic_uint s_mask = PACK_ON | KINDS_ON;
+ static atomic_uint s_gen;
+ 
++/* For 3 s after the pack or a kind is turned on, every entry found is
++ * logged once ("on screen"): turning it off and on over a screen re-uploads
++ * what that screen draws, so the log names the entries in it. */
++static atomic_llong s_watch_until;      /* ms; 0 = not watching */
++static uint64_t     s_watched[512];
++static unsigned     s_watched_n;
++
++static long long now_ms(void)
++{
++    struct timespec ts;
++    timespec_get(&ts, TIME_UTC);
++    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++}
++
+ static struct nv2a_tex_pack_miss s_miss[NV2A_TEX_PACK_MISSES];
+ static unsigned s_miss_n, s_miss_next;
+ /* Every miss counted, for a reader on another thread (the stats). */
+@@ -288,8 +303,14 @@ uint64_t nv2a_tex_pack_hits(void)
+ 
+ static void set_mask(unsigned m)
+ {
+-    if (atomic_exchange_explicit(&s_mask, m, memory_order_relaxed) != m)
++    unsigned old = atomic_exchange_explicit(&s_mask, m, memory_order_relaxed);
++    if (old != m)
+         atomic_fetch_add_explicit(&s_gen, 1u, memory_order_relaxed);
++    if (m & ~old) {
++        s_watched_n = 0;
++        atomic_store_explicit(&s_watch_until, now_ms() + 3000, memory_order_relaxed);
++        fprintf(stderr, "[TEXPACK] turned on: the entries on screen follow\n");
++    }
+ }
+ 
+ void nv2a_tex_pack_set_enabled(int on)
+@@ -345,6 +366,19 @@ struct nv2a_tex_pack_entry *nv2a_tex_pack_find(uint64_t hash, uint32_t guest_w,
+     if (!e || !(m & (1u << e->kind)))
+         return NULL;
+     s_hits++;
++    {
++        long long until = atomic_load_explicit(&s_watch_until, memory_order_relaxed);
++        unsigned i;
++        if (until && now_ms() < until) {
++            for (i = 0; i < s_watched_n && s_watched[i] != hash; i++)
++                ;
++            if (i == s_watched_n && s_watched_n < 512) {
++                s_watched[s_watched_n++] = hash;
++                fprintf(stderr, "[TEXPACK] on screen %016llX %ux%u kind %u\n",
++                        (unsigned long long)hash, e->width, e->height, e->kind);
++            }
++        }
++    }
+     return e;
+ }
+ 
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,579 @@
+From 99b48cbeff9b4e2af196de5c04e869762d345dc1 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 06:11:51 -0300
+Subject: [PATCH 46/47] Texture pack: file kept open, art read by a loader
+ thread (guest texture until ready), preload of the last run's entries, memory
+ budget, read stats every 5 s
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/nv2a_pb_d3d11.c    |  24 ++-
+ src/kernel/nv2a_tex_pack.c | 404 +++++++++++++++++++++++++++++++++++--
+ src/kernel/nv2a_tex_pack.h |  12 ++
+ 3 files changed, 415 insertions(+), 25 deletions(-)
+
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index f7d7448..8224806 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -1780,6 +1780,9 @@ typedef struct {
+     uint32_t offset, color, width, height, pitch, palette, levels;
+     uint32_t gen, used;
+     uint32_t pack_gen;      /* nv2a_tex_pack_gen() it was uploaded under */
++    /* rdr-port: drawn from the guest's texels while the loader thread reads
++     * this pack entry; re-uploaded once it is ready. */
++    struct nv2a_tex_pack_entry *pack_wait;
+     uint64_t hash;
+     int      live;
+     /* What tex holds: the guest size, or a pack entry's (textures.pack);
+@@ -2234,7 +2237,8 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
+     const uint8_t *p;
+     uint32_t width = t->width, height = t->height, levels = t->levels;
+     uint32_t l;
+-    int bc3 = 0;
++    int bc3 = 0, pending = 0;
++    e->pack_wait = NULL;
+     if (nv2a_tex_pack_count()) {
+         /* rdr-port: the buttons in the chosen style first (F2 "Botones en
+          * pantalla"), F6 or not: a font page by its hash or its indices. */
+@@ -2247,6 +2251,13 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
+             pe = nv2a_tex_pack_find(hash, t->width, t->height);
+             by_idx = 0;
+         }
++        /* rdr-port: art not read yet goes to the loader thread; this frame
++         * draws the guest's texture and the cache re-uploads when ready. */
++        if (pe && !by_idx && pe->kind == XRTP_KIND_ART && !nv2a_tex_pack_texels_async(pe)) {
++            e->pack_wait = pe;
++            pe = NULL;
++            pending = 1;
++        }
+         if (pe && by_idx && (src = nv2a_tex_pack_texels(pe)) != NULL) {
+             src = font_retint(pe, src, t);
+             width = pe->width;
+@@ -2269,7 +2280,7 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
+             width = pe->width;
+             height = pe->height;
+             levels = pe->levels;
+-        } else {
++        } else if (!pending) {
+             nv2a_tex_pack_miss(hash, t->width, t->height, t->color, t->levels);
+         }
+     }
+@@ -2379,16 +2390,20 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
+         /* A pack toggle (nv2a_tex_pack_gen) changes what the same texels
+          * upload as: re-upload as if the hash had moved. */
+         uint32_t pg = nv2a_tex_pack_gen();
+-        if (e->gen != g->flips || e->pack_gen != pg) {
++        /* rdr-port: the loader thread finished this one's pack entry. */
++        int ready = e->pack_wait && nv2a_tex_pack_ready(e->pack_wait);
++        if (e->gen != g->flips || e->pack_gen != pg || ready) {
+             uint64_t h = tex_hash_pal(mem, t, bytes);
+             s_tex_rehash++;
+             e->gen = g->flips;
+-            if (h != e->hash || e->pack_gen != pg) {
++            if (h != e->hash || e->pack_gen != pg || ready) {
+                 s_tex_changed++;
+                 /* The hash moves only with the texels: a failed upload keeps
+                  * the old texture and is tried again next flip. */
+                 if (!tex_upload(e, t, h))
+                     return s_black_srv;
++                if (ready)
++                    nv2a_tex_pack_note_late();
+                 e->hash = h;
+                 e->pack_gen = pg;
+             }
+@@ -5502,6 +5517,7 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
+         }
+     }
+     pump();
++    nv2a_tex_pack_frame();      /* rdr-port: read stats, memory budget */
+     /* rdr-port: paused in the background. The guest's clocks, vblanks and
+      * sound stop (xbox_PauseSet) and this flip waits, pumping the window,
+      * until it is in front again; the last frame stays on screen. */
+diff --git a/src/kernel/nv2a_tex_pack.c b/src/kernel/nv2a_tex_pack.c
+index 94fbd5e..c951fe5 100644
+--- a/src/kernel/nv2a_tex_pack.c
++++ b/src/kernel/nv2a_tex_pack.c
+@@ -116,9 +116,20 @@ static void fail(char *err, size_t errlen, const char *msg)
+         snprintf(err, errlen, "%s", msg);
+ }
+ 
++static void loader_start(void);
++static void loader_stop(void);
++static FILE *s_file;                 /* the pack, kept open */
++static atomic_ullong s_loaded_bytes; /* texels held in memory */
++
+ void nv2a_tex_pack_unload(void)
+ {
+     unsigned i;
++    loader_stop();
++    if (s_file) {
++        fclose(s_file);
++        s_file = NULL;
++    }
++    atomic_store(&s_loaded_bytes, 0);
+     for (i = 0; i < s_count; i++)
+         free(s_entries[i].data);
+     free(s_entries);
+@@ -268,6 +279,7 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
+     s_text_scale = text_scale ? text_scale : scale;
+     memcpy(s_kind_count, kinds, sizeof kinds);
+     s_bc3_count = bc3;
++    loader_start();
+     return (int)count;
+ }
+ 
+@@ -426,38 +438,85 @@ struct nv2a_tex_pack_entry *nv2a_tex_pack_find(uint64_t hash, uint32_t guest_w,
+     return e;
+ }
+ 
+-const uint32_t *nv2a_tex_pack_texels(struct nv2a_tex_pack_entry *e)
++/* ---- Reading the texels (rdr-port: kept open, a loader thread) ----------
++ *
++ * The file stays open (one handle, under s_io), not opened and closed per
++ * entry. Art (kind ART) is read by a loader thread: the upload that first
++ * wants it gets NULL, draws the guest's own texture, and re-uploads when the
++ * entry is ready (nv2a_tex_pack_ready); a frame never waits on the disk for
++ * it. Fonts, text and buttons stay read on the spot (small, and a letter
++ * that changed a frame late would show). The entries used are written to
++ * <pack>.usadas every minute and read back at the next start, where the
++ * loader preloads them while it has nothing else to do. Read entries are
++ * kept up to a budget (RECOMP_TEXPACK_MB, default 1536); past it, the
++ * flip frees the ones unused longest (nv2a_tex_pack_frame), which are read
++ * again if drawn again. Every 5 s with reads, a line says what they cost. */
++
++#define ST_NONE    0       /* not read */
++#define ST_QUEUED  1       /* asked of the loader */
++#define ST_LOADING 2       /* being read */
++#define ST_READY   3       /* data holds the texels */
++
++static atomic_flag  s_io = ATOMIC_FLAG_INIT;
++static atomic_ullong s_st_sync_n, s_st_sync_us, s_st_sync_max, s_st_async_n, s_st_async_us,
++                     s_st_late, s_st_bytes, s_st_pre;
++static unsigned long long s_budget = 1536ull << 20;
++
++static long long now_us(void)
++{
++    struct timespec ts;
++    timespec_get(&ts, TIME_UTC);
++    return (long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
++}
++
++static void io_lock(void)
++{
++    while (atomic_flag_test_and_set_explicit(&s_io, memory_order_acquire))
++        ;
++}
++
++static void io_unlock(void)
++{
++    atomic_flag_clear_explicit(&s_io, memory_order_release);
++}
++
++static int state(const struct nv2a_tex_pack_entry *e)
++{
++    return __atomic_load_n(&e->state, __ATOMIC_ACQUIRE);
++}
++
++static int claim(struct nv2a_tex_pack_entry *e, int from)
++{
++    int want = from;
++    return __atomic_compare_exchange_n(&e->state, &want, ST_LOADING, 0, __ATOMIC_ACQ_REL,
++                                       __ATOMIC_ACQUIRE);
++}
++
++/* Reads e's payload; NULL on failure (the entry goes back to not read). */
++static uint32_t *read_entry(struct nv2a_tex_pack_entry *e)
+ {
+-    FILE *f;
+-    uint32_t *data;
+-    if (!e)
+-        return NULL;
+-    if (e->data)
+-        return e->data;
+     /* bytes is a multiple of 4 either way: texels * 4, or 16 per block. */
+-    data = (uint32_t *)malloc(e->bytes);
+-    if (!data)
+-        return NULL;
+-    f = s_path ? fopen(s_path, "rb") : NULL;
+-    if (!f || pack_seek(f, e->offset) != 0 || fread(data, 1u, e->bytes, f) != e->bytes) {
++    uint32_t *data = (uint32_t *)malloc(e->bytes);
++    int ok = 0;
++    if (data) {
++        io_lock();
++        if (!s_file && s_path)
++            s_file = fopen(s_path, "rb");
++        ok = s_file && pack_seek(s_file, e->offset) == 0
++             && fread(data, 1u, e->bytes, s_file) == e->bytes;
++        io_unlock();
++    }
++    if (!ok) {
+         /* Said for the first four failures only: the guest texels are
+          * uploaded instead, and the next upload tries again. */
+         static unsigned said;
+         if (said++ < 4)
+             fprintf(stderr, "[ENHANCE] textures.pack: cannot read entry %016llX from %s\n",
+                     (unsigned long long)e->hash, s_path ? s_path : "?");
+-        if (f)
+-            fclose(f);
+         free(data);
++        __atomic_store_n(&e->state, ST_NONE, __ATOMIC_RELEASE);
+         return NULL;
+     }
+-    fclose(f);
+-    {   /* Each entry's first use, so a run's log says what the pack replaced. */
+-        static unsigned said;
+-        if (said++ < 400)
+-            fprintf(stderr, "[TEXPACK] hit %016llX %ux%u kind %u\n",
+-                    (unsigned long long)e->hash, e->width, e->height, e->kind);
+-    }
+ #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+     if (!e->bc3) {  /* BC3 blocks are bytes in GPU order: never swapped */
+         size_t i;
+@@ -467,10 +526,313 @@ const uint32_t *nv2a_tex_pack_texels(struct nv2a_tex_pack_entry *e)
+         }
+     }
+ #endif
++    {   /* Each entry's first use, so a run's log says what the pack replaced. */
++        static atomic_uint said;
++        if (atomic_fetch_add(&said, 1u) < 400)
++            fprintf(stderr, "[TEXPACK] hit %016llX %ux%u kind %u\n",
++                    (unsigned long long)e->hash, e->width, e->height, e->kind);
++    }
++    e->last_use = now_ms();
++    e->used_ever = 1;
++    atomic_fetch_add(&s_loaded_bytes, e->bytes);
++    atomic_fetch_add(&s_st_bytes, e->bytes);
+     e->data = data;
++    __atomic_store_n(&e->state, ST_READY, __ATOMIC_RELEASE);
+     return data;
+ }
+ 
++const uint32_t *nv2a_tex_pack_texels(struct nv2a_tex_pack_entry *e)
++{
++    long long t0;
++    unsigned long long us, max;
++    uint32_t *d;
++    if (!e)
++        return NULL;
++    if (state(e) == ST_READY) {
++        e->last_use = now_ms();
++        return e->data;
++    }
++    t0 = now_us();
++    if (!claim(e, ST_NONE) && !claim(e, ST_QUEUED)) {
++        /* the loader is reading it: wait for it, as the old way waited */
++        while (state(e) == ST_LOADING)
++            ;
++        d = state(e) == ST_READY ? e->data : NULL;
++    } else {
++        d = read_entry(e);
++    }
++    us = (unsigned long long)(now_us() - t0);
++    atomic_fetch_add(&s_st_sync_n, 1u);
++    atomic_fetch_add(&s_st_sync_us, us);
++    max = atomic_load(&s_st_sync_max);
++    while (us > max && !atomic_compare_exchange_weak(&s_st_sync_max, &max, us))
++        ;
++    return d;
++}
++
++int nv2a_tex_pack_ready(const struct nv2a_tex_pack_entry *e)
++{
++    return e && state(e) == ST_READY;
++}
++
++void nv2a_tex_pack_note_late(void)
++{
++    atomic_fetch_add(&s_st_late, 1u);
++}
++
++#ifdef _WIN32
++#include <windows.h>
++
++#define QN 4096u
++static struct nv2a_tex_pack_entry *s_q[QN];
++static unsigned  s_q_head, s_q_tail;         /* under s_q_lock */
++static atomic_flag s_q_lock = ATOMIC_FLAG_INIT;
++static HANDLE    s_q_event, s_loader;
++static volatile LONG s_loader_stop;
++static uint64_t *s_pre;                      /* the last run's entries, to preload */
++static unsigned  s_pre_n, s_pre_next;
++
++static void q_lock(void)
++{
++    while (atomic_flag_test_and_set_explicit(&s_q_lock, memory_order_acquire))
++        ;
++}
++
++static void q_unlock(void)
++{
++    atomic_flag_clear_explicit(&s_q_lock, memory_order_release);
++}
++
++static struct nv2a_tex_pack_entry *q_pop(void)
++{
++    struct nv2a_tex_pack_entry *e = NULL;
++    q_lock();
++    if (s_q_head != s_q_tail)
++        e = s_q[s_q_head++ % QN];
++    q_unlock();
++    return e;
++}
++
++static struct nv2a_tex_pack_entry *find_hash(uint64_t h)
++{
++    unsigned lo = 0, hi = s_count;
++    while (lo < hi) {
++        unsigned mid = lo + (hi - lo) / 2;
++        if (s_entries[mid].hash < h)
++            lo = mid + 1;
++        else
++            hi = mid;
++    }
++    return lo < s_count && s_entries[lo].hash == h ? &s_entries[lo] : NULL;
++}
++
++static const char *used_path(void)
++{
++    static char p[1024];
++    snprintf(p, sizeof p, "%s.usadas", s_path ? s_path : "textures.pack");
++    return p;
++}
++
++static void used_load(void)
++{
++    FILE *f = fopen(used_path(), "r");
++    unsigned long long h;
++    unsigned cap = 0;
++    s_pre_n = s_pre_next = 0;
++    if (!f)
++        return;
++    while (fscanf(f, "%llx", &h) == 1) {
++        if (s_pre_n == cap) {
++            uint64_t *n = (uint64_t *)realloc(s_pre, (cap ? cap * 2 : 1024) * sizeof *n);
++            if (!n)
++                break;
++            s_pre = n;
++            cap = cap ? cap * 2 : 1024;
++        }
++        s_pre[s_pre_n++] = h;
++    }
++    fclose(f);
++}
++
++static void used_save(void)
++{
++    static unsigned last;
++    unsigned i, n = 0;
++    FILE *f;
++    for (i = 0; i < s_count; i++)
++        n += s_entries[i].used_ever && s_entries[i].kind == XRTP_KIND_ART;
++    if (n == last || !n)
++        return;
++    f = fopen(used_path(), "w");
++    if (!f)
++        return;             /* a read-only folder: no preload next time */
++    for (i = 0; i < s_count; i++)
++        if (s_entries[i].used_ever && s_entries[i].kind == XRTP_KIND_ART)
++            fprintf(f, "%016llX\n", (unsigned long long)s_entries[i].hash);
++    fclose(f);
++    last = n;
++}
++
++static DWORD WINAPI loader_main(LPVOID unused)
++{
++    long long saved = now_ms();
++    (void)unused;
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
++    while (!s_loader_stop) {
++        struct nv2a_tex_pack_entry *e;
++        int idle = 1;
++        while ((e = q_pop()) != NULL) {
++            long long t0;
++            idle = 0;
++            if (!claim(e, ST_QUEUED))
++                continue;           /* the flip read it itself meanwhile */
++            t0 = now_us();
++            read_entry(e);
++            atomic_fetch_add(&s_st_async_n, 1u);
++            atomic_fetch_add(&s_st_async_us, (unsigned long long)(now_us() - t0));
++        }
++        if (now_ms() - saved > 60000) {
++            used_save();
++            saved = now_ms();
++        }
++        /* Nothing asked: preload one of the last run's, within 3/4 of the budget. */
++        if (s_pre_next < s_pre_n && atomic_load(&s_loaded_bytes) < s_budget / 4 * 3) {
++            e = find_hash(s_pre[s_pre_next++]);
++            if (e && claim(e, ST_NONE)) {
++                read_entry(e);
++                atomic_fetch_add(&s_st_pre, 1u);
++            }
++            Sleep(2);              /* gently: the game's own reads come first */
++            continue;
++        }
++        if (idle)
++            WaitForSingleObject(s_q_event, 500);
++    }
++    used_save();
++    return 0;
++}
++
++static void loader_start(void)
++{
++    const char *mb = getenv("RECOMP_TEXPACK_MB");
++    s_budget = (unsigned long long)(mb && atoi(mb) > 0 ? atoi(mb) : 1536) << 20;
++    used_load();
++    s_loader_stop = 0;
++    s_q_head = s_q_tail = 0;
++    if (!s_q_event)
++        s_q_event = CreateEventA(NULL, FALSE, FALSE, NULL);
++    s_loader = s_q_event ? CreateThread(NULL, 0, loader_main, NULL, 0, NULL) : NULL;
++    fprintf(stderr, "[TEXPACK] loader thread %s; budget %llu MB; %u to preload\n",
++            s_loader ? "on" : "off (reads on the spot)", s_budget >> 20, s_pre_n);
++}
++
++static void loader_stop(void)
++{
++    if (!s_loader)
++        return;
++    s_loader_stop = 1;
++    SetEvent(s_q_event);
++    WaitForSingleObject(s_loader, 5000);
++    CloseHandle(s_loader);
++    s_loader = NULL;
++}
++
++const uint32_t *nv2a_tex_pack_texels_async(struct nv2a_tex_pack_entry *e)
++{
++    int ok, want = ST_NONE;
++    if (!e)
++        return NULL;
++    if (state(e) == ST_READY) {
++        e->last_use = now_ms();
++        return e->data;
++    }
++    if (!s_loader)
++        return nv2a_tex_pack_texels(e);
++    if (!__atomic_compare_exchange_n(&e->state, &want, ST_QUEUED, 0, __ATOMIC_ACQ_REL,
++                                     __ATOMIC_ACQUIRE))
++        return NULL;                /* already asked or being read */
++    q_lock();
++    ok = s_q_tail - s_q_head < QN;
++    if (ok)
++        s_q[s_q_tail++ % QN] = e;
++    q_unlock();
++    if (!ok) {
++        __atomic_store_n(&e->state, ST_NONE, __ATOMIC_RELEASE);
++        return nv2a_tex_pack_texels(e);   /* queue full: read it now */
++    }
++    SetEvent(s_q_event);
++    return NULL;
++}
++#else
++static void loader_start(void) {}
++static void loader_stop(void) {}
++const uint32_t *nv2a_tex_pack_texels_async(struct nv2a_tex_pack_entry *e)
++{
++    return nv2a_tex_pack_texels(e);
++}
++#endif
++
++static int by_last_use(const void *a, const void *b)
++{
++    const struct nv2a_tex_pack_entry *x = *(struct nv2a_tex_pack_entry *const *)a;
++    const struct nv2a_tex_pack_entry *y = *(struct nv2a_tex_pack_entry *const *)b;
++    return x->last_use < y->last_use ? -1 : x->last_use > y->last_use;
++}
++
++/* Once a flip, on the thread that uploads (so no upload is using what is
++ * freed): the stats line every 5 s, and the memory budget every 2 s. */
++void nv2a_tex_pack_frame(void)
++{
++    static long long last_line, last_trim;
++    long long now = now_ms();
++    if (!s_count)
++        return;
++    if (!last_line)
++        last_line = now;
++    if (now - last_line >= 5000) {
++        unsigned long long sn = atomic_exchange(&s_st_sync_n, 0), su = atomic_exchange(&s_st_sync_us, 0);
++        unsigned long long sm = atomic_exchange(&s_st_sync_max, 0);
++        unsigned long long an = atomic_exchange(&s_st_async_n, 0), au = atomic_exchange(&s_st_async_us, 0);
++        unsigned long long late = atomic_exchange(&s_st_late, 0), by = atomic_exchange(&s_st_bytes, 0);
++        unsigned long long pre = atomic_exchange(&s_st_pre, 0);
++        if (sn || an || pre)
++            fprintf(stderr, "[TEXPACK] 5 s: en el cuadro %llu lecturas %.1f ms (max %.1f ms); "
++                    "en segundo plano %llu (%.1f ms), precargadas %llu, cambios tardios %llu; "
++                    "leido %.1f MB, en memoria %.0f MB\n",
++                    sn, su / 1000.0, sm / 1000.0, an, au / 1000.0, pre, late, by / 1048576.0,
++                    atomic_load(&s_loaded_bytes) / 1048576.0);
++        last_line = now;
++    }
++    if (now - last_trim >= 2000 && atomic_load(&s_loaded_bytes) > s_budget) {
++        struct nv2a_tex_pack_entry **v;
++        unsigned i, n = 0, freed = 0;
++        unsigned long long target = s_budget / 10 * 8;
++        last_trim = now;
++        v = (struct nv2a_tex_pack_entry **)malloc(s_count * sizeof *v);
++        if (!v)
++            return;
++        for (i = 0; i < s_count; i++)
++            if (state(&s_entries[i]) == ST_READY && now - s_entries[i].last_use > 30000)
++                v[n++] = &s_entries[i];
++        qsort(v, n, sizeof *v, by_last_use);
++        for (i = 0; i < n && atomic_load(&s_loaded_bytes) > target; i++) {
++            struct nv2a_tex_pack_entry *e = v[i];
++            int want = ST_READY;
++            if (!__atomic_compare_exchange_n(&e->state, &want, ST_NONE, 0, __ATOMIC_ACQ_REL,
++                                             __ATOMIC_ACQUIRE))
++                continue;
++            free(e->data);
++            e->data = NULL;
++            atomic_fetch_sub(&s_loaded_bytes, e->bytes);
++            freed++;
++        }
++        free(v);
++        if (freed)
++            fprintf(stderr, "[TEXPACK] memoria: %u texturas sin usar liberadas, quedan %.0f MB\n",
++                    freed, atomic_load(&s_loaded_bytes) / 1048576.0);
++    }
++}
++
+ /* ---- Misses ------------------------------------------------------------- */
+ 
+ void nv2a_tex_pack_miss(uint64_t hash, uint32_t w, uint32_t h, uint32_t color,
+diff --git a/src/kernel/nv2a_tex_pack.h b/src/kernel/nv2a_tex_pack.h
+index b2487fa..7b5ecf9 100644
+--- a/src/kernel/nv2a_tex_pack.h
++++ b/src/kernel/nv2a_tex_pack.h
+@@ -67,6 +67,9 @@ struct nv2a_tex_pack_entry {
+     uint32_t  kind;           /* XRTP_KIND_* */
+     int       bc3;            /* payload is BC3 blocks */
+     uint32_t *data;           /* read on first use; NULL until then */
++    int       state;          /* rdr-port: 0 not read, 1 asked, 2 reading, 3 read */
++    int       used_ever;      /* read in this run (the next run preloads it) */
++    long long last_use;       /* ms: the last upload that used it */
+ };
+ 
+ /* Load `path`: validates the header, the index bounds against the file
+@@ -76,6 +79,15 @@ struct nv2a_tex_pack_entry {
+ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen);
+ void nv2a_tex_pack_unload(void);
+ 
++/* rdr-port: the texels if read, else asks the loader thread and returns
++ * NULL (draw the guest's texture meanwhile, re-upload once
++ * nv2a_tex_pack_ready). nv2a_tex_pack_frame: once a flip, on the upload
++ * thread (stats line, memory budget). note_late: a re-upload done. */
++const uint32_t *nv2a_tex_pack_texels_async(struct nv2a_tex_pack_entry *e);
++int  nv2a_tex_pack_ready(const struct nv2a_tex_pack_entry *e);
++void nv2a_tex_pack_frame(void);
++void nv2a_tex_pack_note_late(void);
++
+ unsigned nv2a_tex_pack_count(void);
+ unsigned nv2a_tex_pack_scale(void);
+ /* Entries of one XRTP_KIND_*, and the BC3 ones, for the log line. */
+-- 
+2.55.0.windows.3
+

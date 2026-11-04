@@ -1,0 +1,88 @@
+From 9a5b782f337b8f30382370d000442e2ab77da4a4 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 14:29:48 -0300
+Subject: [PATCH] Texture pack: wait on its locks by yielding, not spinning
+
+A bare spin starved the below-normal loader holding the lock across a disk
+read: on a 4-core PC with a hard disk, turning the improved textures on from
+F2 left the flip spinning, the window unpumped and every key ignored.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/nv2a_tex_pack.c | 34 +++++++++++++++++++++++++++++++---
+ 1 file changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/src/kernel/nv2a_tex_pack.c b/src/kernel/nv2a_tex_pack.c
+index c951fe5..ad35d44 100644
+--- a/src/kernel/nv2a_tex_pack.c
++++ b/src/kernel/nv2a_tex_pack.c
+@@ -11,6 +11,7 @@
+ #include <time.h>
+ 
+ #ifdef _WIN32
++#include <windows.h>
+ #define pack_seek(f, off) _fseeki64((f), (long long)(off), SEEK_SET)
+ #define pack_tell(f)      _ftelli64(f)
+ #else
+@@ -469,10 +470,35 @@ static long long now_us(void)
+     return (long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+ }
+ 
++/* A wait that lets the other thread run. A bare spin starved the loader:
++ * it runs below normal and holds the lock across a disk read, so on a slow
++ * disk with every core busy the flip spun for seconds waiting on it, the
++ * window went unpumped and the game ignored every key (seen on a 4-core PC
++ * with a hard disk, right after "Texturas mejoradas" was turned on). */
++static void relax(unsigned *n)
++{
++    if (++*n < 64)
++        return;
++#ifdef _WIN32
++    /* SwitchToThread first (any ready thread on this core, the loader too:
++     * Sleep(0) yields only to equal priority), then real sleeps. */
++    if (*n < 256)
++        SwitchToThread();
++    else
++        Sleep(1);
++#else
++    {
++        struct timespec ts = { 0, 200000 };
++        nanosleep(&ts, NULL);
++    }
++#endif
++}
++
+ static void io_lock(void)
+ {
++    unsigned n = 0;
+     while (atomic_flag_test_and_set_explicit(&s_io, memory_order_acquire))
+-        ;
++        relax(&n);
+ }
+ 
+ static void io_unlock(void)
+@@ -555,8 +581,9 @@ const uint32_t *nv2a_tex_pack_texels(struct nv2a_tex_pack_entry *e)
+     t0 = now_us();
+     if (!claim(e, ST_NONE) && !claim(e, ST_QUEUED)) {
+         /* the loader is reading it: wait for it, as the old way waited */
++        unsigned n = 0;
+         while (state(e) == ST_LOADING)
+-            ;
++            relax(&n);
+         d = state(e) == ST_READY ? e->data : NULL;
+     } else {
+         d = read_entry(e);
+@@ -594,8 +621,9 @@ static unsigned  s_pre_n, s_pre_next;
+ 
+ static void q_lock(void)
+ {
++    unsigned n = 0;
+     while (atomic_flag_test_and_set_explicit(&s_q_lock, memory_order_acquire))
+-        ;
++        relax(&n);
+ }
+ 
+ static void q_unlock(void)
+-- 
+2.55.0.windows.3
+

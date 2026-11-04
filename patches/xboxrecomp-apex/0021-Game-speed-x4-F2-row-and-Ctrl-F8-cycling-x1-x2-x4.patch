@@ -1,0 +1,51 @@
+From b869b0fe6c46bc07dd52a70e29bd7f06f3029c97 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:51:09 -0300
+Subject: [PATCH 21/47] Game speed x4: F2 row and Ctrl+F8 cycling x1, x2, x4
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/host_menu.c     | 6 +++---
+ src/d3d/nv2a_pb_d3d11.c | 4 ++--
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/src/d3d/host_menu.c b/src/d3d/host_menu.c
+index 787e2c4..97b4335 100644
+--- a/src/d3d/host_menu.c
++++ b/src/d3d/host_menu.c
+@@ -169,9 +169,9 @@ static int s_fps_on;
+ static int get_fps(void) { return s_fps_on; }
+ static void set_fps(int i) { s_fps_on = i; }
+ 
+-static const char *const k_speed[] = { "x1", "x2 (Ctrl+F8)", NULL };
+-static int get_speed(void) { return xbox_Speed() > 1; }
+-static void set_speed(int i) { xbox_SpeedSet(i ? 2u : 1u); }
++static const char *const k_speed[] = { "x1", "x2 (Ctrl+F8)", "x4 (Ctrl+F8 dos veces)", NULL };
++static int get_speed(void) { return xbox_Speed() >= 4 ? 2 : xbox_Speed() > 1; }
++static void set_speed(int i) { xbox_SpeedSet(1u << i); }
+ 
+ static const xbox_menu_item k_builtin[] = {
+     { NULL, "Gráficos", NULL, NULL, NULL },
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index 292f21f..6ceea39 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -356,13 +356,13 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+             nv2a_pb_mlog_request();
+             return 0;
+         }
+-        /* Ctrl+F8: game speed x2 on, off again (kernel_pacing.h). F8 alone
++        /* Ctrl+F8: game speed x1 -> x2 -> x4 -> x1 (kernel_pacing.h). F8 alone
+          * reached the window by itself (a hotkey of another program) and
+          * left the game running at x2 from the title screen. */
+         if (w == VK_F8 && (GetKeyState(VK_CONTROL) & 0x8000)) {
+             extern unsigned xbox_Speed(void);
+             extern void xbox_SpeedSet(unsigned speed);
+-            xbox_SpeedSet(xbox_Speed() > 1 ? 1u : 2u);
++            xbox_SpeedSet(xbox_Speed() >= 4 ? 1u : xbox_Speed() > 1 ? 4u : 2u);
+             return 0;
+         }
+     }
+-- 
+2.55.0.windows.3
+

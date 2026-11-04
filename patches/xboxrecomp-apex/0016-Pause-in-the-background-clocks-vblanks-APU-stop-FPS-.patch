@@ -1,0 +1,380 @@
+From c73bd58a70492b82a48e403346d749bb57481915 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 18:02:49 -0300
+Subject: [PATCH 16/47] Pause in the background (clocks, vblanks, APU stop),
+ FPS box and vsync in the F2 menu
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apu/apu_core.c         | 13 +++++++
+ src/d3d/host_menu.c        | 72 ++++++++++++++++++++++++++++++++++++--
+ src/d3d/host_menu.h        | 10 ++++--
+ src/d3d/nv2a_pb_d3d11.c    | 52 +++++++++++++++++++++++++--
+ src/kernel/kernel_pacing.c | 39 +++++++++++++++++++--
+ src/kernel/kernel_pacing.h |  5 +++
+ 6 files changed, 181 insertions(+), 10 deletions(-)
+
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index f304635..84c7e87 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -27,6 +27,7 @@
+ #include "fpconv.h"
+ #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
+ #include "../kernel/kernel_prof.h"          /* RECOMP_TRACE=dpc: ISR, se_frame */
++#include "../kernel/kernel_pacing.h"        /* xbox_Paused */
+ #include "apu_lockstat.h"                    /* RECOMP_TRACE=apu_lock */
+ 
+ /* ============================================================
+@@ -1362,6 +1363,18 @@ static void *mcpx_apu_frame_thread(void *arg)
+             d->is_idle = false;
+             continue;
+         }
++        /* rdr-port: the pause (kernel_pacing.h). No frame, as for a trapped
++         * front end: the device drains to silence and the schedule restarts
++         * at the resume (mcpx_apu_pace_step drops a lag that long). */
++        if (xbox_Paused()) {
++            if (xa2_is_active())
++                xa2_expect_drain();
++            hs_rebase();
++            apu_lockstat_hold_end(APU_LOCK_FRAME);
++            qemu_cond_timedwait(&d->cond, &d->lock, 10);
++            apu_lockstat_hold_begin(APU_LOCK_FRAME);
++            continue;
++        }
+ 
+         /* Always run the audio output loop — the software mixer and test tone
+          * need continuous frame delivery regardless of APU register state.
+diff --git a/src/d3d/host_menu.c b/src/d3d/host_menu.c
+index b4b3e2a..3c94097 100644
+--- a/src/d3d/host_menu.c
++++ b/src/d3d/host_menu.c
+@@ -161,6 +161,14 @@ static void set_glow(int i) { nv2a_d3d11_glow_off(i); }
+ static int get_dump(void) { return nv2a_d3d11_tex_dump(); }
+ static void set_dump(int i) { nv2a_d3d11_tex_dump_set(i); }
+ 
++static int get_pause(void) { return nv2a_d3d11_pause_focus(-1); }
++static void set_pause(int i) { nv2a_d3d11_pause_focus(i); }
++static int get_vsync(void) { return nv2a_d3d11_vsync(-1); }
++static void set_vsync(int i) { nv2a_d3d11_vsync(i); }
++static int s_fps_on;
++static int get_fps(void) { return s_fps_on; }
++static void set_fps(int i) { s_fps_on = i; }
++
+ static const char *const k_speed[] = { "x1", "x2 (F8)", NULL };
+ static int get_speed(void) { return xbox_Speed() > 1; }
+ static void set_speed(int i) { xbox_SpeedSet(i ? 2u : 1u); }
+@@ -176,7 +184,10 @@ static const xbox_menu_item k_builtin[] = {
+     { "snap_2d", "HUD alineado a píxel", k_snap, get_snap, set_snap },
+     { "glow", "Brillo a pantalla completa", k_glow, get_glow, set_glow },
+     { "tex_dump", "Volcar texturas a carpeta", k_onoff, get_dump, set_dump },
++    { "vsync", "VSync (sincronía vertical)", k_onoff, get_vsync, set_vsync },
++    { "fps", "Mostrar FPS", k_onoff, get_fps, set_fps },
+     { NULL, "Juego", NULL, NULL, NULL },
++    { "pause_unfocused", "Pausa al cambiar de ventana", k_onoff, get_pause, set_pause },
+     { "language", "Idioma (al reiniciar)", k_lang, get_lang, set_lang },
+     { NULL, "Velocidad", k_speed, get_speed, set_speed },
+ };
+@@ -417,13 +428,68 @@ static int make_surface(unsigned w, unsigned h, unsigned fpx)
+     return 1;
+ }
+ 
+-const uint32_t *xbox_MenuPixels(unsigned back_h, unsigned *w, unsigned *h, unsigned *gen)
++/* The FPS box: presents a second, counted over half a second (the D3D11
++ * backend asks once a present). Redrawn only when the number moves. */
++static const uint32_t *fps_pixels(unsigned back_h, unsigned *w, unsigned *h, unsigned *gen)
++{
++    static LARGE_INTEGER freq, t0;
++    static unsigned frames, shown = ~0u, fps;
++    LARGE_INTEGER now;
++    unsigned fpx, W, H;
++    char v[32];
++    int i;
++
++    QueryPerformanceCounter(&now);
++    if (!freq.QuadPart) {
++        QueryPerformanceFrequency(&freq);
++        t0 = now;
++    }
++    frames++;
++    if (now.QuadPart - t0.QuadPart >= freq.QuadPart / 2) {
++        fps = (unsigned)((double)frames * (double)freq.QuadPart / (double)(now.QuadPart - t0.QuadPart) + 0.5);
++        frames = 0;
++        t0 = now;
++    }
++    fpx = back_h / 40u;
++    if (fpx < 13u) fpx = 13u;
++    if (fpx > 40u) fpx = 40u;
++    W = fpx * 9u / 2u;
++    H = fpx * 3u / 2u;
++    if (s_px && fps == shown && W == s_w && H == s_h)
++        goto out;
++    if (!make_surface(W, H, fpx))
++        return NULL;
++    shown = fps;
++    s_sig = 0;                              /* the menu redraws when it opens */
++    fill(0, 0, (int)W, (int)H, RGB(18, 14, 12));
++    SelectObject(s_dc, s_font_big);
++    snprintf(v, sizeof v, "%u FPS", fps);
++    text(0, 0, (int)W, (int)H, v, DT_CENTER,
++         fps >= 55 ? RGB(150, 220, 120) : fps >= 30 ? RGB(235, 195, 125) : RGB(235, 110, 90));
++    GdiFlush();
++    for (i = 0; i < (int)(W * H); i++)
++        s_px[i] = (s_px[i] & 0x00FFFFFFu) | 0xB4000000u;
++    s_gen++;
++out:
++    *w = s_w;
++    *h = s_h;
++    *gen = s_gen;
++    return s_px;
++}
++
++const uint32_t *xbox_MenuPixels(unsigned back_h, unsigned *w, unsigned *h, unsigned *gen,
++                                int *corner)
+ {
+     unsigned fpx, row, pad, W, H, sig = 2166136261u;
+     int i, y;
+ 
+-    if (!s_open)
+-        return NULL;
++    *corner = 0;
++    if (!s_open) {
++        if (!s_fps_on)
++            return NULL;
++        *corner = 1;
++        return fps_pixels(back_h, w, h, gen);
++    }
+     fpx = back_h / 42u;
+     if (fpx < 13u) fpx = 13u;
+     if (fpx > 40u) fpx = 40u;
+diff --git a/src/d3d/host_menu.h b/src/d3d/host_menu.h
+index 4085fc7..7dc2e43 100644
+--- a/src/d3d/host_menu.h
++++ b/src/d3d/host_menu.h
+@@ -39,8 +39,10 @@ int  xbox_MenuIsOpen(void);
+ /* A key edge from the window; 1 when the menu took it. */
+ int  xbox_MenuKey(int vk, int down, int repeat);
+ /* The panel for a back buffer h lines tall, as top-down BGRA with alpha;
+- * *gen moves whenever the pixels do. NULL while closed. */
+-const uint32_t *xbox_MenuPixels(unsigned back_h, unsigned *w, unsigned *h, unsigned *gen);
++ * *gen moves whenever the pixels do. Closed: the FPS box when "Mostrar FPS"
++ * is on (*corner = 1: top left, not centred), else NULL. */
++const uint32_t *xbox_MenuPixels(unsigned back_h, unsigned *w, unsigned *h, unsigned *gen,
++                                int *corner);
+ 
+ /* nv2a_pb_d3d11.c: resize the window's client area at the next flip. */
+ void nv2a_d3d11_window_request(unsigned w, unsigned h);
+@@ -49,6 +51,10 @@ int  nv2a_d3d11_glow_off(int set);
+ /* nv2a_pb_d3d11.c: textures dumped as PNG (RECOMP_TEXTURES_DUMP_DIR). */
+ void nv2a_d3d11_tex_dump_set(int on);
+ int  nv2a_d3d11_tex_dump(void);
++/* nv2a_pb_d3d11.c: the game pauses while the window is in the background;
++ * the present waits for the display. 0/1 set, -1 only reads. */
++int  nv2a_d3d11_pause_focus(int set);
++int  nv2a_d3d11_vsync(int set);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index 009952b..74fa5f3 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -90,6 +90,11 @@ static struct xbox_title_clock s_title_clock;
+  * is the SDL window's knob (default on there); here only a value that turns
+  * it on changes anything, so an unset key keeps the stock behaviour. */
+ static UINT                    s_sync_interval;
++/* rdr-port: the window is in the background (WM_ACTIVATEAPP), and whether the
++ * game pauses then (F2, RECOMP_PAUSE_UNFOCUSED=0 turns it off). */
++static volatile int            s_unfocused;
++static int                     s_pause_focus = -1;
++static int                     s_vsync_set;   /* the F2 menu chose: init keeps it */
+ static ID3D11Device           *s_dev;
+ static ID3D11DeviceContext    *s_ctx;
+ static ID3D11DeviceContext1   *s_ctx1;   /* NULL below D3D 11.1: partial clears clear it all */
+@@ -312,6 +317,7 @@ extern void xbox_InputMouseWin32Msg(void *hwnd, unsigned msg, uintptr_t w, intpt
+ extern void xbox_InputMouseWin32Sync(void *hwnd);
+ extern void xbox_InputMouseWin32Release(void *hwnd);
+ extern int xbox_InputKeyboardOn(void);
++extern void xbox_PauseSet(int on);          /* kernel_pacing.h */
+ 
+ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+ {
+@@ -386,6 +392,10 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+     case WM_KILLFOCUS:
+         xbox_InputKeysClear();
+         return 0;
++    /* rdr-port: another program came to the front; the next flip pauses. */
++    case WM_ACTIVATEAPP:
++        s_unfocused = !w;
++        break;
+     }
+     if (m == WM_CLOSE) {
+         /* Closing the window ends the run, like the CPU path's window.
+@@ -687,7 +697,8 @@ static int init(void)
+         fprintf(stderr, LOGP "CreateWindow failed (%lu)\n", GetLastError());
+         return 0;
+     }
+-    s_sync_interval = recomp_env_on(RENV_PRESENT_VSYNC) ? 1 : 0;
++    if (!s_vsync_set)
++        s_sync_interval = recomp_env_on(RENV_PRESENT_VSYNC) ? 1 : 0;
+     if (recomp_env(RENV_PRESENT_VSYNC))
+         fprintf(stderr, LOGP "present vsync %s (RECOMP_PRESENT_VSYNC=%s)\n",
+                 s_sync_interval ? "on" : "off", recomp_env(RENV_PRESENT_VSYNC));
+@@ -3710,6 +3721,27 @@ int nv2a_d3d11_glow_off(int set)
+     return s_glow_off;
+ }
+ 
++/* rdr-port, the F2 menu: pause in the background, and vsync. */
++int nv2a_d3d11_pause_focus(int set)
++{
++    if (s_pause_focus < 0) {
++        const char *e = getenv("RECOMP_PAUSE_UNFOCUSED");
++        s_pause_focus = !(e && *e == '0');
++    }
++    if (set >= 0)
++        s_pause_focus = set != 0;
++    return s_pause_focus;
++}
++
++int nv2a_d3d11_vsync(int set)
++{
++    if (set >= 0) {
++        s_sync_interval = set != 0;
++        s_vsync_set = 1;
++    }
++    return s_sync_interval != 0;
++}
++
+ /* After setup_pixel (s_stage_rt): what rt now holds. A copy of a larger
+  * target, or of a copy (the glow's blur passes between two small targets),
+  * or nothing of the kind. */
+@@ -4611,10 +4643,11 @@ static void menu_present(void)
+     ID3D11ShaderResourceView *none = NULL;
+     const uint32_t *px;
+     unsigned w, h, gen;
++    int corner;
+     float sx, sy, k;
+     D3D11_VIEWPORT vp;
+ 
+-    if (!s_back || s_menu_failed || !(px = xbox_MenuPixels(s_back_h, &w, &h, &gen)))
++    if (!s_back || s_menu_failed || !(px = xbox_MenuPixels(s_back_h, &w, &h, &gen, &corner)))
+         return;
+     if (!blit_init())
+         return;
+@@ -4689,6 +4722,8 @@ static void menu_present(void)
+     vp.Height = (float)h * k;
+     vp.TopLeftX = ((float)s_back_w - vp.Width) * 0.5f;
+     vp.TopLeftY = ((float)s_back_h - vp.Height) * 0.5f;
++    if (corner)                             /* the FPS box */
++        vp.TopLeftX = vp.TopLeftY = (float)(s_back_h / 60u);
+     vp.MinDepth = 0.0f;
+     vp.MaxDepth = 1.0f;
+     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back_rtv, NULL);
+@@ -5293,6 +5328,19 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
+     if (!init())
+         return;
+     pump();
++    /* rdr-port: paused in the background. The guest's clocks, vblanks and
++     * sound stop (xbox_PauseSet) and this flip waits, pumping the window,
++     * until it is in front again; the last frame stays on screen. */
++    if (s_unfocused && nv2a_d3d11_pause_focus(-1)) {
++        xbox_PauseSet(1);
++        fprintf(stderr, LOGP "paused (window in the background)\n");
++        while (s_unfocused && nv2a_d3d11_pause_focus(-1)) {
++            Sleep(15);
++            pump();
++        }
++        xbox_PauseSet(0);
++        fprintf(stderr, LOGP "resumed\n");
++    }
+     {
+         wchar_t tb[192];
+         if (xbox_FramebufferWindowTitleText(tb, 192, &s_title_clock))
+diff --git a/src/kernel/kernel_pacing.c b/src/kernel/kernel_pacing.c
+index 16bee65..8490532 100644
+--- a/src/kernel/kernel_pacing.c
++++ b/src/kernel/kernel_pacing.c
+@@ -55,14 +55,13 @@ unsigned xbox_Speed(void)
+     return __atomic_load_n(&s_warp_cur, __ATOMIC_ACQUIRE)->speed;
+ }
+ 
+-void xbox_SpeedSet(unsigned speed)
++/* Speed 0 is the pause: the clocks stand still. */
++static void speed_publish(unsigned speed)
+ {
+     SpeedWarp *o = __atomic_load_n(&s_warp_cur, __ATOMIC_ACQUIRE);
+     SpeedWarp *n = o == &s_warp[0] ? &s_warp[1] : &s_warp[0];
+     LARGE_INTEGER now;
+ 
+-    if (speed < 1)
+-        speed = 1;
+     if (speed == o->speed)
+         return;
+     QueryPerformanceCounter(&now);
+@@ -73,6 +72,35 @@ void xbox_SpeedSet(unsigned speed)
+     __atomic_add_fetch(&s_speed_gen, 1u, __ATOMIC_RELEASE);
+ }
+ 
++static volatile unsigned s_paused_speed;    /* the speed to resume at; 0 = running */
++
++void xbox_SpeedSet(unsigned speed)
++{
++    if (speed < 1)
++        speed = 1;
++    if (s_paused_speed)
++        s_paused_speed = speed;               /* applies on resume */
++    else
++        speed_publish(speed);
++}
++
++void xbox_PauseSet(int on)
++{
++    if (on && !s_paused_speed) {
++        s_paused_speed = xbox_Speed();
++        speed_publish(0);
++    } else if (!on && s_paused_speed) {
++        unsigned s = s_paused_speed;
++        s_paused_speed = 0;
++        speed_publish(s);
++    }
++}
++
++int xbox_Paused(void)
++{
++    return s_paused_speed != 0;
++}
++
+ /* ── The vblank schedule ─────────────────────────────────── */
+ 
+ static uint64_t vblank_due(const XboxVblankSchedule *s, uint64_t n)
+@@ -88,6 +116,11 @@ int xbox_VblankSchedule(XboxVblankSchedule *s, uint64_t now_ns,
+     uint64_t due;
+ 
+     *restarted_late_ns = 0;
++    if (xbox_Paused()) {
++        /* No vblank while paused; the speed change at resume restarts the grid. */
++        *next_due_ns = now_ns + 10000000ull;
++        return 0;
++    }
+     if (!s->started || s->speed_gen != __atomic_load_n(&s_speed_gen, __ATOMIC_ACQUIRE)) {
+         /* A speed change starts a new grid at the new rate from now. */
+         s->speed_gen = __atomic_load_n(&s_speed_gen, __ATOMIC_ACQUIRE);
+diff --git a/src/kernel/kernel_pacing.h b/src/kernel/kernel_pacing.h
+index 6594508..6de80cc 100644
+--- a/src/kernel/kernel_pacing.h
++++ b/src/kernel/kernel_pacing.h
+@@ -45,6 +45,11 @@ typedef struct {
+  * on the host's clock. 1 is stock. Any thread, any time. */
+ void     xbox_SpeedSet(unsigned speed);
+ unsigned xbox_Speed(void);
++/* rdr-port: the pause (the window lost focus). Every guest clock stands
++ * still, no vblank is raised and the APU makes no frames; xbox_Speed() reads
++ * 0 meanwhile, and a xbox_SpeedSet waits for the resume. */
++void     xbox_PauseSet(int on);
++int      xbox_Paused(void);
+ /* A host performance-counter reading as the guest's clock sees it. */
+ int64_t  xbox_WarpCounts(int64_t real_counts);
+ /* GetTickCount64 on the guest's clock (kernel_hal.c). */
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,106 @@
+From 2eb772e0ce3977d24f3edef4e5bbe1e0388c23f2 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 10:05:05 -0300
+Subject: [PATCH 10/47] kernel: XC_VIDEO back to 4:3; 16:9 present for 640x480
+ frames too
+
+A widescreen flag made Red Dead Revolver pick its 720x480 mode, whose device creation failed and hung the boot. The title port widens the game on top of 640x480 instead; the D3D11 present shows a 480-line frame at 16:9 when widescreen is wanted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/nv2a_pb_d3d11.c  |  8 ++++----
+ src/kernel/kernel.h      |  6 +++---
+ src/kernel/kernel_xbox.c | 12 ++++++++----
+ 3 files changed, 15 insertions(+), 11 deletions(-)
+
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index 2845b26..5ee755e 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -598,8 +598,8 @@ static const char s_vs_passthrough_src[] =
+ static void create_black_texture(void);
+ 
+ /* rdr-port: a widescreen TV reported to the title (xbox_VideoWidescreen,
+- * kernel.h): a title that then picks a 720x480 mode draws it anamorphic, for
+- * a 16:9 screen, as on the console. The present shows such a frame at 16:9
++ * kernel.h): the title draws its 16:9 view anamorphic into its 480-line
++ * frame, as for a widescreen TV. The present shows such a frame at 16:9
+  * (wide_frame) and the window starts 16:9. */
+ static int wide_tv(void)
+ {
+@@ -609,7 +609,7 @@ static int wide_tv(void)
+ 
+ static int wide_frame(const RenderTarget *rt)
+ {
+-    return rt && wide_tv() && rt->w == 720 && rt->h == 480;
++    return rt && wide_tv() && (rt->w == 640 || rt->w == 720) && rt->h == 480;
+ }
+ 
+ static int init(void)
+@@ -4501,7 +4501,7 @@ static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int in
+     hch = ch * rt->n;
+     nv2a_present_crop(hcw, hch, rt->hw, rt->hh, rt->n, rt->pad, overscan, filter, &c);
+     if (wide_frame(rt)) {
+-        /* anamorphic 720x480: shown 16:9, scaled smoothly */
++        /* anamorphic: shown 16:9, scaled smoothly */
+         c.fit_w = (c.fit_h * 16u + 4u) / 9u;
+         if (filter == NV2A_PRESENT_INTEGER)
+             filter = NV2A_PRESENT_LINEAR;
+diff --git a/src/kernel/kernel.h b/src/kernel/kernel.h
+index b21cc8f..29ffc10 100644
+--- a/src/kernel/kernel.h
++++ b/src/kernel/kernel.h
+@@ -1322,9 +1322,9 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
+ #define XC_VIDEO_FLAGS_PAL_60Hz     0x00400000
+ #define XC_VIDEO_FLAGS_HDTV         XC_VIDEO_FLAGS_HDTV_480p
+ 
+-/* rdr-port: whether XC_VIDEO reports a widescreen TV (default no, which is
+- * what every title saw before the values above were fixed). A title reads it
+- * at boot to pick its video mode. RECOMP_WIDESCREEN=1 turns it on. */
++/* rdr-port: whether a 16:9 display is wanted (RECOMP_WIDESCREEN=1, the F2
++ * menu). XC_VIDEO still reports 4:3; the title port widens the game itself
++ * and the D3D11 present shows its 640x480 frame at 16:9. */
+ void xbox_VideoWidescreenSet(int on);
+ int  xbox_VideoWidescreen(void);
+ 
+diff --git a/src/kernel/kernel_xbox.c b/src/kernel/kernel_xbox.c
+index c27eecb..1dcb6e5 100644
+--- a/src/kernel/kernel_xbox.c
++++ b/src/kernel/kernel_xbox.c
+@@ -14,7 +14,8 @@
+ #include <string.h>
+ #include <time.h>
+ 
+-/* rdr-port: XC_VIDEO's widescreen flag (kernel.h). */
++/* rdr-port: a widescreen display wanted (kernel.h). Not reported through
++ * XC_VIDEO (see there); read by the D3D11 present and the title port. */
+ static int s_widescreen = -1;
+ 
+ void xbox_VideoWidescreenSet(int on)
+@@ -240,9 +241,12 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
+         break;
+ 
+     case XC_VIDEO:
+-        /* NTSC; widescreen only when asked (xbox_VideoWidescreen) */
++        /* NTSC 4:3, no HDTV modes. A widescreen flag here makes Red Dead
++         * Revolver pick its 720x480 mode, which D3D's device creation then
++         * refused (boot hung); xbox_VideoWidescreen is applied by the title
++         * port on top of the 640x480 mode instead (rdr-apex widescreen.c). */
+         if (ValueLength >= sizeof(ULONG)) {
+-            *(PULONG)Value = xbox_VideoWidescreen() ? XC_VIDEO_FLAGS_WIDESCREEN : 0;
++            *(PULONG)Value = 0;
+             if (Type) *Type = 4; /* REG_DWORD */
+             if (ResultLength) *ResultLength = sizeof(ULONG);
+         }
+@@ -333,7 +337,7 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
+         memcpy(blk + 0x28, &s_tz.std_bias, 4);
+         memcpy(blk + 0x2C, &s_tz.dlt_bias, 4);
+         { ULONG v = 1; memcpy(blk + 0x30, &v, 4); }                       /* English */
+-        { ULONG v = xbox_VideoWidescreen() ? XC_VIDEO_FLAGS_WIDESCREEN : 0; memcpy(blk + 0x34, &v, 4); }
++        { ULONG v = 0; memcpy(blk + 0x34, &v, 4); }                       /* NTSC 4:3 */
+         /* 0x58 is MiscFlags (0); DvdRegion is the last field, at 0x5C. */
+         { ULONG v = 1; memcpy(blk + 0x5C, &v, 4); }                       /* DVD region 1 */
+         if (Type) *Type = 3;
+-- 
+2.55.0.windows.3
+

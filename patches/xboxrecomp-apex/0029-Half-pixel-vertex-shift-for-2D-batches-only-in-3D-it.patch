@@ -1,0 +1,32 @@
+From a383018506576f4af7be9d3a1c42d85c481d07a4 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 15:47:55 -0300
+Subject: [PATCH 29/47] Half-pixel vertex shift for 2D batches only: in 3D it
+ opened sliver lines from the characters' shadows
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/nv2a_pb_d3d11.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index 45e0efc..b7c1af6 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -3826,8 +3826,11 @@ static void set_vp(const struct nv2a_pb_vsh *v, const struct nv2a_pb_gpu *g,
+      * The shaders move only such vertices, by (n-1)/2 host pixels (vp_off.w,
+      * in guest pixels). Moving every vertex left a host column and row
+      * uncovered at whole-pixel edges instead: the right and bottom border of
+-     * the menu's book, a 512x256 target filled edge to edge. */
+-    vc.c[7] = rt->n > 1 ? -0.5f * (float)(rt->n - 1) / (float)rt->n : 0.0f;
++     * the menu's book, a 512x256 target filled edge to edge. 2D batches
++     * only: in 3D, two vertices 1/16 px apart, one moved, opened slivers
++     * that were too thin to cover a pixel (flickering lines from the
++     * characters' shadows to the ground). */
++    vc.c[7] = two_d && rt->n > 1 ? -0.5f * (float)(rt->n - 1) / (float)rt->n : 0.0f;
+     /* Screen positions on an anti-aliased surface are in its clip's units:
+      * x and y reach the surface's pixels times the factor (nv2a_aa_x). */
+     vc.c[0] *= (float)nv2a_aa_x(g->format);
+-- 
+2.55.0.windows.3
+

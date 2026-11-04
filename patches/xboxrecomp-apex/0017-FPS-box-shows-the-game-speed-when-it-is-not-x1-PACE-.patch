@@ -1,0 +1,70 @@
+From 1c666620b5a9aad95edeb64e8d5763fe1a801d7c Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 18:27:40 -0300
+Subject: [PATCH 17/47] FPS box shows the game speed when it is not x1; [PACE]
+ logs speed changes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/host_menu.c        | 15 ++++++++++-----
+ src/kernel/kernel_pacing.c |  2 ++
+ 2 files changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/src/d3d/host_menu.c b/src/d3d/host_menu.c
+index 3c94097..22f2a25 100644
+--- a/src/d3d/host_menu.c
++++ b/src/d3d/host_menu.c
+@@ -433,9 +433,9 @@ static int make_surface(unsigned w, unsigned h, unsigned fpx)
+ static const uint32_t *fps_pixels(unsigned back_h, unsigned *w, unsigned *h, unsigned *gen)
+ {
+     static LARGE_INTEGER freq, t0;
+-    static unsigned frames, shown = ~0u, fps;
++    static unsigned frames, shown = ~0u, shown_speed, fps;
+     LARGE_INTEGER now;
+-    unsigned fpx, W, H;
++    unsigned fpx, W, H, speed = xbox_Speed();
+     char v[32];
+     int i;
+ 
+@@ -453,17 +453,22 @@ static const uint32_t *fps_pixels(unsigned back_h, unsigned *w, unsigned *h, uns
+     fpx = back_h / 40u;
+     if (fpx < 13u) fpx = 13u;
+     if (fpx > 40u) fpx = 40u;
+-    W = fpx * 9u / 2u;
++    /* Fast-forward on (F8) says so: x2 doubles the frames too. */
++    W = fpx * (speed > 1 ? 15u : 9u) / 2u;
+     H = fpx * 3u / 2u;
+-    if (s_px && fps == shown && W == s_w && H == s_h)
++    if (s_px && fps == shown && speed == shown_speed && W == s_w && H == s_h)
+         goto out;
+     if (!make_surface(W, H, fpx))
+         return NULL;
+     shown = fps;
++    shown_speed = speed;
+     s_sig = 0;                              /* the menu redraws when it opens */
+     fill(0, 0, (int)W, (int)H, RGB(18, 14, 12));
+     SelectObject(s_dc, s_font_big);
+-    snprintf(v, sizeof v, "%u FPS", fps);
++    if (speed > 1)
++        snprintf(v, sizeof v, "%u FPS  x%u (F8)", fps, speed);
++    else
++        snprintf(v, sizeof v, "%u FPS", fps);
+     text(0, 0, (int)W, (int)H, v, DT_CENTER,
+          fps >= 55 ? RGB(150, 220, 120) : fps >= 30 ? RGB(235, 195, 125) : RGB(235, 110, 90));
+     GdiFlush();
+diff --git a/src/kernel/kernel_pacing.c b/src/kernel/kernel_pacing.c
+index 8490532..957299b 100644
+--- a/src/kernel/kernel_pacing.c
++++ b/src/kernel/kernel_pacing.c
+@@ -78,6 +78,8 @@ void xbox_SpeedSet(unsigned speed)
+ {
+     if (speed < 1)
+         speed = 1;
++    if (speed != (s_paused_speed ? s_paused_speed : xbox_Speed()))
++        fprintf(stderr, "[PACE] game speed x%u\n", speed);
+     if (s_paused_speed)
+         s_paused_speed = speed;               /* applies on resume */
+     else
+-- 
+2.55.0.windows.3
+

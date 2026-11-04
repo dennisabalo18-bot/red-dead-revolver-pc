@@ -1,0 +1,391 @@
+From f8fc5dbf65160c8cf758e160c838569611a0835f Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 01:39:11 -0300
+Subject: [PATCH 39/47] Windows: PlayStation, Switch and other pads through
+ SDL3 beside XInput (sdl_pads_win.c, XBOXRECOMP_SDL3_DIR), with rumble
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/input/CMakeLists.txt  |  10 ++
+ src/input/sdl_pads_win.c  | 255 ++++++++++++++++++++++++++++++++++++++
+ src/input/sdl_pads_win.h  |  13 ++
+ src/input/xinput_device.c |  32 ++++-
+ 4 files changed, 309 insertions(+), 1 deletion(-)
+ create mode 100644 src/input/sdl_pads_win.c
+ create mode 100644 src/input/sdl_pads_win.h
+
+diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
+index bcbfe37..e8c44a0 100644
+--- a/src/input/CMakeLists.txt
++++ b/src/input/CMakeLists.txt
+@@ -37,6 +37,16 @@ if(WIN32)
+     # MSVC keeps the plain name. tests/input_xinput_imports checks the result.
+     target_link_libraries(xbox_input PUBLIC platform
+         $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>)
++    # rdr-port: PlayStation, Switch and other pads through SDL3 beside XInput
++    # (sdl_pads_win.c). XBOXRECOMP_SDL3_DIR: an unpacked SDL3-devel-*-VC.zip.
++    set(XBOXRECOMP_SDL3_DIR "" CACHE PATH "SDL3 VC development package (pads beside XInput)")
++    if(XBOXRECOMP_SDL3_DIR)
++        set(SDL3_DIR "${XBOXRECOMP_SDL3_DIR}/cmake")
++        find_package(SDL3 3.2 CONFIG REQUIRED)
++        target_sources(xbox_input PRIVATE sdl_pads_win.c)
++        target_compile_definitions(xbox_input PRIVATE XBOXRECOMP_SDL_PADS=1)
++        target_link_libraries(xbox_input PUBLIC SDL3::SDL3)
++    endif()
+ else()
+     find_package(SDL3 3.2 CONFIG REQUIRED)
+     target_sources(xbox_input PRIVATE keyboard_sdl.c mouse_sdl.c)
+diff --git a/src/input/sdl_pads_win.c b/src/input/sdl_pads_win.c
+new file mode 100644
+index 0000000..784800e
+--- /dev/null
++++ b/src/input/sdl_pads_win.c
+@@ -0,0 +1,255 @@
++/**
++ * rdr-port: PlayStation, Switch and other non-Xbox pads on Windows, through
++ * SDL3's gamepad API, beside XInput (xinput_device.c's Windows backend).
++ *
++ * XInput keeps the Xbox pads (and Steam's virtual pad, which is one): SDL's
++ * XInput, RawInput, WGI and GameInput drivers are off here and any pad SDL
++ * still reports as an Xbox one is skipped, so a pad never shows up twice.
++ * What is left is HIDAPI (DualShock 4, DualSense, Switch Pro...) and
++ * DirectInput (generic pads).
++ *
++ * Ports: a port with an XInput pad is that pad; a port without one is the
++ * SDL pad in the same slot (the first non-Xbox pad on port 0, and so on).
++ *
++ * There is no SDL window and nothing pumps SDL events: the gamepad events
++ * are off, the game's poll (xbox_SdlPadGet) updates the pads at most every
++ * 2 ms, and the device list is read again once a second. The flip tick's
++ * read (try = 1) only tries the lock and never updates.
++ *
++ * Built with XBOXRECOMP_SDL_PADS (src/input/CMakeLists.txt); SDL3.dll goes
++ * beside the exe. Without the dll the pads stay XInput only.
++ */
++#include <windows.h>
++#include <SDL3/SDL.h>
++#include <stdio.h>
++#include <string.h>
++#include "input_backend.h"
++#include "pad_map.h"
++#include "host_pad.h"
++#include "sdl_pads_win.h"
++
++_Static_assert(SDL_GAMEPAD_BUTTON_SOUTH == XBOX_SDL_BUTTON_A
++               && SDL_GAMEPAD_BUTTON_START == XBOX_SDL_BUTTON_START
++               && SDL_GAMEPAD_BUTTON_LEFT_SHOULDER == XBOX_SDL_BUTTON_LEFTSHOULDER
++               && SDL_GAMEPAD_BUTTON_DPAD_RIGHT == XBOX_SDL_BUTTON_DPAD_RIGHT,
++               "XBOX_SDL_BUTTON_* must match SDL_GamepadButton");
++_Static_assert(SDL_GAMEPAD_AXIS_LEFTX == XBOX_SDL_AXIS_LEFTX
++               && SDL_GAMEPAD_AXIS_RIGHTY == XBOX_SDL_AXIS_RIGHTY
++               && SDL_GAMEPAD_AXIS_RIGHT_TRIGGER == XBOX_SDL_AXIS_TRIGGERRIGHT,
++               "XBOX_SDL_AXIS_* must match SDL_GamepadAxis");
++
++struct slot {
++    SDL_Gamepad     *pad;
++    SDL_JoystickID   id;
++    int              family;    /* atomic */
++    xbox_rumble_gate rumble;
++};
++
++static struct slot  s_slot[XBOX_MAX_CONTROLLERS];
++static SDL_Mutex   *s_lock;
++static int          s_state;    /* 0 not tried, 1 up, -1 failed */
++static uint64_t     s_last_scan, s_last_update;
++static DWORD        s_packet[XBOX_MAX_CONTROLLERS];
++
++static int family_of(SDL_GamepadType t)
++{
++    switch (t) {
++    case SDL_GAMEPAD_TYPE_PS3:
++    case SDL_GAMEPAD_TYPE_PS4:
++    case SDL_GAMEPAD_TYPE_PS5:
++        return XBOX_PAD_FAMILY_PLAYSTATION;
++    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
++    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
++    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
++    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
++        return XBOX_PAD_FAMILY_NINTENDO;
++    case SDL_GAMEPAD_TYPE_XBOX360:
++    case SDL_GAMEPAD_TYPE_XBOXONE:
++        return XBOX_PAD_FAMILY_XBOX;
++    default:
++        return XBOX_PAD_FAMILY_GENERIC;
++    }
++}
++
++/* s_lock held. */
++static void close_slot(int p)
++{
++    SDL_CloseGamepad(s_slot[p].pad);
++    s_slot[p].pad = NULL;
++    xbox_RumbleGateReset(&s_slot[p].rumble);
++    __atomic_store_n(&s_slot[p].family, XBOX_PAD_FAMILY_XBOX, __ATOMIC_RELEASE);
++    fprintf(stderr, "[INPUT] SDL pad removed slot=%d\n", p);
++    fflush(stderr);
++}
++
++/* s_lock held: close what went, open what came (non-Xbox pads only). */
++static void rescan(void)
++{
++    SDL_JoystickID *ids;
++    int n = 0;
++
++    for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++)
++        if (s_slot[p].pad && !SDL_GamepadConnected(s_slot[p].pad))
++            close_slot(p);
++    if (!(ids = SDL_GetGamepads(&n)))
++        return;
++    for (int i = 0; i < n; i++) {
++        SDL_GamepadType t = SDL_GetGamepadTypeForID(ids[i]);
++        int open = 0, port = -1;
++        SDL_Gamepad *c;
++        const char *name;
++
++        if (t == SDL_GAMEPAD_TYPE_XBOX360 || t == SDL_GAMEPAD_TYPE_XBOXONE)
++            continue;                   /* XInput has it */
++        for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++)
++            open |= s_slot[p].pad && s_slot[p].id == ids[i];
++        if (open)
++            continue;
++        for (int p = 0; p < XBOX_MAX_CONTROLLERS && port < 0; p++)
++            if (!s_slot[p].pad)
++                port = p;
++        if (port < 0 || !(c = SDL_OpenGamepad(ids[i])))
++            continue;
++        s_slot[port].pad = c;
++        s_slot[port].id = ids[i];
++        xbox_RumbleGateReset(&s_slot[port].rumble);
++        __atomic_store_n(&s_slot[port].family, family_of(SDL_GetGamepadType(c)),
++                         __ATOMIC_RELEASE);
++        name = SDL_GetGamepadName(c);
++        fprintf(stderr, "[INPUT] SDL pad added slot=%d \"%s\"\n", port, name ? name : "?");
++        fflush(stderr);
++    }
++    SDL_free(ids);
++}
++
++static int up(void)
++{
++    if (__atomic_load_n(&s_state, __ATOMIC_ACQUIRE) != 0)
++        return s_state > 0;
++    {
++        /* Only the first caller starts SDL; another waits on the spin. */
++        static volatile long once;
++        if (InterlockedCompareExchange(&once, 1, 0) != 0) {
++            while (__atomic_load_n(&s_state, __ATOMIC_ACQUIRE) == 0)
++                Sleep(1);
++            return s_state > 0;
++        }
++    }
++    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
++    SDL_SetHint(SDL_HINT_XINPUT_ENABLED, "0");
++    SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
++    SDL_SetHint(SDL_HINT_JOYSTICK_WGI, "0");
++    SDL_SetHint(SDL_HINT_JOYSTICK_GAMEINPUT, "0");
++    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
++    if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD) || !(s_lock = SDL_CreateMutex())) {
++        fprintf(stderr, "[INPUT] SDL pads off: %s\n", SDL_GetError());
++        fflush(stderr);
++        __atomic_store_n(&s_state, -1, __ATOMIC_RELEASE);
++        return 0;
++    }
++    SDL_SetGamepadEventsEnabled(false);
++    SDL_SetJoystickEventsEnabled(false);
++    SDL_UpdateGamepads();
++    s_last_scan = s_last_update = GetTickCount64();
++    rescan();
++    fprintf(stderr, "[INPUT] SDL pads on (SDL %d.%d.%d): PlayStation, Switch and others\n",
++            SDL_VERSIONNUM_MAJOR(SDL_GetVersion()), SDL_VERSIONNUM_MINOR(SDL_GetVersion()),
++            SDL_VERSIONNUM_MICRO(SDL_GetVersion()));
++    fflush(stderr);
++    __atomic_store_n(&s_state, 1, __ATOMIC_RELEASE);
++    return 1;
++}
++
++static uint32_t extras_of(SDL_Gamepad *c)
++{
++    static const struct { SDL_GamepadButton b; uint32_t bit; } k[] = {
++        { SDL_GAMEPAD_BUTTON_GUIDE,    XBOX_HOST_GUIDE },
++        { SDL_GAMEPAD_BUTTON_MISC1,    XBOX_HOST_MISC1 },
++        { SDL_GAMEPAD_BUTTON_TOUCHPAD, XBOX_HOST_TOUCHPAD },
++    };
++    uint32_t e = 0;
++    for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
++        if (SDL_GetGamepadButton(c, k[i].b))
++            e |= k[i].bit;
++    return e;
++}
++
++static void read_pad(SDL_Gamepad *c, XBOX_HOST_SDL_GAMEPAD *pad)
++{
++    for (int b = 0; b < XBOX_SDL_BUTTON_COUNT; b++)
++        pad->button[b] = SDL_GetGamepadButton(c, (SDL_GamepadButton)b) ? 1 : 0;
++    for (int a = 0; a < XBOX_SDL_AXIS_COUNT; a++)
++        pad->axis[a] = SDL_GetGamepadAxis(c, (SDL_GamepadAxis)a);
++}
++
++/* s_lock held. */
++static void flush_rumble(int p, int asked)
++{
++    uint16_t l, r;
++    SDL_Gamepad *c = s_slot[p].pad;
++    if (c && xbox_RumbleGatePoll(&s_slot[p].rumble, GetTickCount64(), asked, &l, &r))
++        (void)SDL_RumbleGamepad(c, l, r, (l || r) ? 1000 : 0);
++}
++
++DWORD xbox_SdlPadGet(DWORD port, InputRaw *raw, DWORD *packet, int extras, int try_only)
++{
++    XBOX_HOST_SDL_GAMEPAD pad;
++    SDL_Gamepad *c;
++    uint32_t extra;
++    uint64_t now;
++
++    if (port >= XBOX_MAX_CONTROLLERS || !up())
++        return ERROR_DEVICE_NOT_CONNECTED;
++    if (try_only) {
++        if (!SDL_TryLockMutex(s_lock))
++            return XBOX_INPUT_BUSY;
++    } else {
++        SDL_LockMutex(s_lock);
++        now = GetTickCount64();
++        if (now - s_last_update >= 2) {
++            s_last_update = now;
++            SDL_UpdateGamepads();
++            for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++)
++                flush_rumble(p, 0);
++        }
++        if (now - s_last_scan >= XBOX_INPUT_PROBE_MS) {
++            s_last_scan = now;
++            SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
++            rescan();
++        }
++    }
++    c = s_slot[port].pad;
++    if (!c || !SDL_GamepadConnected(c)) {
++        SDL_UnlockMutex(s_lock);
++        return ERROR_DEVICE_NOT_CONNECTED;
++    }
++    read_pad(c, &pad);
++    extra = (extras || try_only) ? extras_of(c) : 0u;
++    SDL_UnlockMutex(s_lock);
++    if (packet)
++        *packet = ++s_packet[port];
++    xbox_PadRawSdl(&pad, extra, raw);
++    return ERROR_SUCCESS;
++}
++
++DWORD xbox_SdlPadRumble(DWORD port, const XBOX_VIBRATION *v)
++{
++    SDL_Gamepad *c;
++    if (port >= XBOX_MAX_CONTROLLERS || __atomic_load_n(&s_state, __ATOMIC_ACQUIRE) <= 0)
++        return ERROR_DEVICE_NOT_CONNECTED;
++    SDL_LockMutex(s_lock);
++    c = s_slot[port].pad;
++    if (c) {
++        xbox_RumbleGateSet(&s_slot[port].rumble, v->wLeftMotorSpeed, v->wRightMotorSpeed);
++        flush_rumble((int)port, 1);
++    }
++    SDL_UnlockMutex(s_lock);
++    return c ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
++}
++
++int xbox_SdlPadFamily(DWORD port)
++{
++    if (port >= XBOX_MAX_CONTROLLERS || __atomic_load_n(&s_state, __ATOMIC_ACQUIRE) <= 0)
++        return -1;
++    return s_slot[port].pad ? __atomic_load_n(&s_slot[port].family, __ATOMIC_ACQUIRE) : -1;
++}
+diff --git a/src/input/sdl_pads_win.h b/src/input/sdl_pads_win.h
+new file mode 100644
+index 0000000..6d78497
+--- /dev/null
++++ b/src/input/sdl_pads_win.h
+@@ -0,0 +1,13 @@
++/* rdr-port: non-Xbox pads on Windows through SDL3 (sdl_pads_win.c), used by
++ * xinput_device.c's Windows backend for a port with no XInput pad. */
++#ifndef XBOX_SDL_PADS_WIN_H
++#define XBOX_SDL_PADS_WIN_H
++#include "input_backend.h"
++
++/* The SDL pad in port's slot: ERROR_SUCCESS (raw, packet filled),
++ * ERROR_DEVICE_NOT_CONNECTED, or with try_only XBOX_INPUT_BUSY. */
++DWORD xbox_SdlPadGet(DWORD port, InputRaw *raw, DWORD *packet, int extras, int try_only);
++DWORD xbox_SdlPadRumble(DWORD port, const XBOX_VIBRATION *v);
++/* XBOX_PAD_FAMILY_* of the SDL pad on port, -1 when there is none. */
++int   xbox_SdlPadFamily(DWORD port);
++#endif
+diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
+index a4f661b..20a3205 100644
+--- a/src/input/xinput_device.c
++++ b/src/input/xinput_device.c
+@@ -25,6 +25,9 @@
+ 
+ #include <xinput.h>
+ #pragma comment(lib, "xinput.lib")
++#ifdef XBOXRECOMP_SDL_PADS
++#include "sdl_pads_win.h"     /* rdr-port: PlayStation and other pads */
++#endif
+ 
+ /* The keyboard on port 0 is shared with the SDL backend (keyboard.c); the
+  * window procedures in fb_present.c and nv2a_pb_d3d11.c record the keys. */
+@@ -89,8 +92,13 @@ static DWORD xi_get_raw(DWORD port, InputRaw *raw, DWORD *packet_out, int extras
+         g = xi.Gamepad;
+         packet = xi.dwPacketNumber;
+     }
+-    if (rc != ERROR_SUCCESS)
++    if (rc != ERROR_SUCCESS) {
++#ifdef XBOXRECOMP_SDL_PADS
++        if (xbox_SdlPadGet(port, raw, packet_out, extras, 0) == ERROR_SUCCESS)
++            return ERROR_SUCCESS;
++#endif
+         return rc;
++    }
+     memcpy(&pad, &g, sizeof pad);
+     pad.wButtons &= (uint16_t)~XI_GUIDE;
+     *packet_out = packet;
+@@ -105,12 +113,26 @@ static DWORD xi_get_raw(DWORD port, InputRaw *raw, DWORD *packet_out, int extras
+ static DWORD xi_read_raw(DWORD port, InputRaw *raw)
+ {
+     DWORD packet;
++#ifdef XBOXRECOMP_SDL_PADS
++    /* The flip tick must not wait: XInput first, then only a try at SDL. */
++    xi_state_ex xe;
++    XINPUT_STATE xs;
++    xi_get_state_ex_fn ex = xi_reader();
++    if ((ex ? ex(port, &xe) : XInputGetState(port, &xs)) != ERROR_SUCCESS)
++        return xbox_SdlPadGet(port, raw, &packet, 1, 1);
++#endif
+     return xi_get_raw(port, raw, &packet, 1);
+ }
+ 
+ /* XInput cannot tell Steam's virtual pad from a real one, nor the family. */
+ static int xi_family(DWORD port)
+ {
++#ifdef XBOXRECOMP_SDL_PADS
++    XINPUT_STATE xi;
++    int f = xbox_SdlPadFamily(port);
++    if (f >= 0 && XInputGetState(port, &xi) != ERROR_SUCCESS)
++        return f;
++#endif
+     (void)port;
+     return XBOX_PAD_FAMILY_XBOX;
+ }
+@@ -129,6 +151,14 @@ static DWORD xi_set_state(DWORD port, const XBOX_VIBRATION *v)
+     XINPUT_VIBRATION xv;
+     xv.wLeftMotorSpeed  = v->wLeftMotorSpeed;
+     xv.wRightMotorSpeed = v->wRightMotorSpeed;
++#ifdef XBOXRECOMP_SDL_PADS
++    {
++        DWORD rc = XInputSetState(port, &xv);
++        if (rc == ERROR_SUCCESS)
++            return rc;
++        return xbox_SdlPadRumble(port, v) == ERROR_SUCCESS ? ERROR_SUCCESS : rc;
++    }
++#endif
+     return XInputSetState(port, &xv);
+ }
+ 
+-- 
+2.55.0.windows.3
+

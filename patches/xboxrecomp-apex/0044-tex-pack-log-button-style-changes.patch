@@ -1,0 +1,29 @@
+From ebe29c67bc9d9ef0c26a67519c8bf846527b315d Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 04:12:45 -0300
+Subject: [PATCH 44/47] tex pack: log button style changes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/nv2a_tex_pack.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/kernel/nv2a_tex_pack.c b/src/kernel/nv2a_tex_pack.c
+index 15dc3dd..94fbd5e 100644
+--- a/src/kernel/nv2a_tex_pack.c
++++ b/src/kernel/nv2a_tex_pack.c
+@@ -339,8 +339,10 @@ void nv2a_tex_pack_set_button_style(int style)
+ {
+     if (style < -1 || style > 2)
+         style = -1;
+-    if (atomic_exchange_explicit(&s_btn_style, style, memory_order_relaxed) != style)
++    if (atomic_exchange_explicit(&s_btn_style, style, memory_order_relaxed) != style) {
+         atomic_fetch_add_explicit(&s_gen, 1u, memory_order_relaxed);
++        fprintf(stderr, "[TEXPACK] button style %d\n", style);
++    }
+ }
+ 
+ int nv2a_tex_pack_button_style(void)
+-- 
+2.55.0.windows.3
+

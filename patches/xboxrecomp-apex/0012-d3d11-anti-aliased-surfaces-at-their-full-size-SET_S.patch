@@ -1,0 +1,117 @@
+From 1fc1fb20c6196889ee4993559ab93bd4f48fd613 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 13:51:33 -0300
+Subject: [PATCH 12/47] d3d11: anti-aliased surfaces at their full size
+ (SET_SURFACE_FORMAT AA)
+
+A CENTER_CORNER_2 / SQUARE_OFFSET_4 surface is 2x / 2x2 its clip; the clip,
+clear rect and screen positions are in the smaller units, as xemu's
+pgraph_apply_anti_aliasing_factor. Red Dead Revolver draws its smoke and
+reticle into the 640x480 back buffer as a 4x surface under a 320x240 clip,
+and they showed at half size in the top-left quarter.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/nv2a_pb_d3d11.c          | 29 ++++++++++++++++++++++++++---
+ src/kernel/nv2a_backend_common.h | 17 +++++++++++++++++
+ 2 files changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index 5ee755e..7a822b6 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -929,7 +929,9 @@ static int rt_grow(RenderTarget *rt, UINT w, UINT h)
+ static RenderTarget *surface(void)
+ {
+     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+-    UINT w = g->clip_x + g->clip_w, h = g->clip_y + g->clip_h;
++    /* An anti-aliased surface is its clip's extent times the factor. */
++    UINT w = (g->clip_x + g->clip_w) * nv2a_aa_x(g->format);
++    UINT h = (g->clip_y + g->clip_h) * nv2a_aa_y(g->format);
+     RenderTarget *free_rt = NULL, *lru = &s_rt[0];
+     int i;
+ 
+@@ -1212,6 +1214,23 @@ static void d3d11_on_zclear(uint32_t param)
+         s_zclears++;
+ }
+ 
++/* nv2a_clear_box or nv2a_draw_box on rt in its pixels: the clip and the
++ * clear rect of an anti-aliased surface are in units the factor
++ * (nv2a_aa_x, nv2a_aa_y) smaller, as xemu scales them. */
++static int aa_box(const struct nv2a_pb_gpu *g, const RenderTarget *rt, uint32_t box[4],
++                  int (*fn)(const struct nv2a_pb_gpu *, uint32_t, uint32_t, uint32_t *))
++{
++    uint32_t ax = nv2a_aa_x(g->format), ay = nv2a_aa_y(g->format);
++
++    if (!fn(g, rt->w / ax, rt->h / ay, box))
++        return 0;
++    box[0] *= ax;
++    box[1] *= ay;
++    box[2] *= ax;
++    box[3] *= ay;
++    return 1;
++}
++
+ static void clear_region(RenderTarget *rt, const struct nv2a_pb_gpu *g, const float c[4])
+ {
+     uint32_t b[4];
+@@ -1221,7 +1240,7 @@ static void clear_region(RenderTarget *rt, const struct nv2a_pb_gpu *g, const fl
+     /* The clear rect, else the clip (nv2a_clear_box): one target serves every
+      * clip of its surface (rt_grow), so a whole-target clear would wipe the
+      * parts of the frame another clip drew. */
+-    if (!nv2a_clear_box(g, rt->w, rt->h, b))
++    if (!aa_box(g, rt, b, nv2a_clear_box))
+         return;
+     x0 = b[0]; y0 = b[1]; x1 = b[2]; y1 = b[3];
+     if ((x0 == 0 && y0 == 0 && x1 == rt->w && y1 == rt->h) || !s_ctx1) {
+@@ -3533,6 +3552,10 @@ static void set_vp(const struct nv2a_pb_vsh *v, const struct nv2a_pb_gpu *g,
+ 
+     nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, rt->pad, &vc);
+     nv2a_aspect_map(&vc, rt->w, rt->h, rt->pad, place);
++    /* Screen positions on an anti-aliased surface are in its clip's units:
++     * x and y reach the surface's pixels times the factor (nv2a_aa_x). */
++    vc.c[0] *= (float)nv2a_aa_x(g->format);
++    vc.c[1] *= (float)nv2a_aa_y(g->format);
+     memcpy(vp, vc.c, sizeof vc.c);
+     memcpy(vp + sizeof vc.c, vc.u, sizeof vc.u);
+     if (memo_on() && vp_ok && !memcmp(vp_shadow, vp, sizeof vp)) {
+@@ -3843,7 +3866,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
+         vp.MinDepth = 0;
+         vp.MaxDepth = 1;
+         /* The surface clip, as the hardware scissors (nv2a_draw_box). */
+-        if (!nv2a_draw_box(g, rt->w, rt->h, cb)) {
++        if (!aa_box(g, rt, cb, nv2a_draw_box)) {
+             s_draws_skipped++;
+             return;
+         }
+diff --git a/src/kernel/nv2a_backend_common.h b/src/kernel/nv2a_backend_common.h
+index 119cf26..0c85483 100644
+--- a/src/kernel/nv2a_backend_common.h
++++ b/src/kernel/nv2a_backend_common.h
+@@ -440,6 +440,23 @@ static inline uint32_t nv2a_clear_argb(const struct nv2a_pb_gpu *g)
+  * buffer, and geometry running past the clip (its HUD panels, the menu
+  * frame) otherwise lands in the 16 rows above and below, which no clear
+  * covers, and stays there frame after frame. 0 when nothing is left. */
++/* SET_SURFACE_FORMAT's anti-aliasing (xemu's
++ * pgraph_apply_anti_aliasing_factor): a CENTER_CORNER_2 surface is twice its
++ * clip wide, a SQUARE_OFFSET_4 one twice wide and tall. The clip, the clear
++ * rect and the screen positions are in those smaller units; the surface in
++ * memory has the full size. Red Dead Revolver draws its smoke and reticle
++ * into the 640x480 back buffer as a 4x surface under a 320x240 clip. */
++static inline uint32_t nv2a_aa_x(uint32_t surface_format)
++{
++    uint32_t aa = (surface_format >> 12) & 0xFu;
++    return aa == 1u || aa == 2u ? 2u : 1u;
++}
++
++static inline uint32_t nv2a_aa_y(uint32_t surface_format)
++{
++    return ((surface_format >> 12) & 0xFu) == 2u ? 2u : 1u;
++}
++
+ static inline int nv2a_draw_box(const struct nv2a_pb_gpu *g, uint32_t w, uint32_t h,
+                                 uint32_t box[4])
+ {
+-- 
+2.55.0.windows.3
+

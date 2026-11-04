@@ -1,0 +1,2 @@
+// rdr-port: the exe's icon (tools/iconos.py; assets/iconos/juego.ico is the chosen one).
+1 ICON "../../assets/iconos/juego.ico"

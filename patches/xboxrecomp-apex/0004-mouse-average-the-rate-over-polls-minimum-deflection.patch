@@ -1,0 +1,63 @@
+From 3968588f6fee89383fcc968501663f38b0b19b8e Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 05:41:00 -0300
+Subject: [PATCH 04/47] =?UTF-8?q?=EF=BB=BFmouse:=20average=20the=20rate=20?=
+ =?UTF-8?q?over=20polls,=20minimum=20deflection=20on=20the=20vector=20leng?=
+ =?UTF-8?q?th?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/input/mouse.c | 33 ++++++++++++++++++++++++++++-----
+ 1 file changed, 28 insertions(+), 5 deletions(-)
+
+diff --git a/src/input/mouse.c b/src/input/mouse.c
+index 0d4cef9..a057890 100644
+--- a/src/input/mouse.c
++++ b/src/input/mouse.c
+@@ -412,12 +412,35 @@ int xbox_InputMouseLook(int *x, int *y)
+ #endif
+     dx = XCHG(&s_dx, 0);
+     dy = XCHG(&s_dy, 0);
+-    if (o->look == XBOX_MOUSE_LOOK_NONE || (!dx && !dy))
++    if (o->look == XBOX_MOUSE_LOOK_NONE)
+         return o->look;
+-    *x = xbox_InputMouseModel(dx, o->sensitivity, o->min_deflection);
+-    /* Mouse forward is negative dy on Win32 and SDL alike; stick up is
+-     * positive. */
+-    *y = xbox_InputMouseModel(-dy, o->sensitivity, o->min_deflection);
++    {
++        /* Counts arrive unevenly between polls (0, 7, 2, 9...), and taken
++         * one poll at a time the stick jumps between rest and the minimum
++         * deflection: the camera stutters. Average the rate over a couple
++         * of polls, and apply the minimum to the vector's length, not to
++         * each axis, so slow diagonal motion keeps its direction. Mouse
++         * forward is negative dy on Win32 and SDL alike; stick up is
++         * positive. */
++        static double s_vx, s_vy;
++        double cx, cy, mag, n, out;
++
++        s_vx = 0.5 * s_vx + 0.5 * dx;
++        s_vy = 0.5 * s_vy + 0.5 * -dy;
++        cx = s_vx * o->sensitivity / 40.0;
++        cy = s_vy * o->sensitivity / 40.0;
++        mag = sqrt(cx * cx + cy * cy);
++        if (!(mag > 0.004)) {
++            s_vx = s_vy = 0.0;
++            return o->look;
++        }
++        n = mag < 1.0 ? mag : 1.0;
++        out = (o->min_deflection + (1.0 - o->min_deflection) * n) * 32767.0 / mag;
++        *x = (int)lround(cx * out);
++        *y = (int)lround(cy * out);
++        if (*x > 32767) *x = 32767; else if (*x < -32767) *x = -32767;
++        if (*y > 32767) *y = 32767; else if (*y < -32767) *y = -32767;
++    }
+     if (o->invert_x) *x = -*x;
+     if (o->invert_y) *y = -*y;
+     if (recomp_env(RENV_MOUSE_TRACE) && traced < 200) {
+-- 
+2.55.0.windows.3
+

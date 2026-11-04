@@ -1,0 +1,356 @@
+From 4a435834ab886ab5268efbfa48456cb9fad32c93 Mon Sep 17 00:00:00 2001
+From: rdr-port <rdr-port@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:56:27 -0300
+Subject: [PATCH 14/47] d3d11: texture dump to PNG (pack keys), upscaled pack
+ entries mipmapped
+
+RECOMP_TEXTURES_DUMP / the F2 menu writes every swizzled or DXT texture
+once as <HASH>_<w>x<h>.png. A pack entry larger than its guest texture moves
+the sampler's LOD clamps by the extra levels, and one with mips is
+mipmapped over a guest texture without.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/host_menu.c     |   4 +
+ src/d3d/host_menu.h     |   3 +
+ src/d3d/nv2a_pb_d3d11.c | 223 +++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 225 insertions(+), 5 deletions(-)
+
+diff --git a/src/d3d/host_menu.c b/src/d3d/host_menu.c
+index cc7c9d2..b4b3e2a 100644
+--- a/src/d3d/host_menu.c
++++ b/src/d3d/host_menu.c
+@@ -158,6 +158,9 @@ static const char *const k_glow[] = { "Sí (original)", "No (sin costura)", NULL
+ static int get_glow(void) { return nv2a_d3d11_glow_off(-1) != 0; }
+ static void set_glow(int i) { nv2a_d3d11_glow_off(i); }
+ 
++static int get_dump(void) { return nv2a_d3d11_tex_dump(); }
++static void set_dump(int i) { nv2a_d3d11_tex_dump_set(i); }
++
+ static const char *const k_speed[] = { "x1", "x2 (F8)", NULL };
+ static int get_speed(void) { return xbox_Speed() > 1; }
+ static void set_speed(int i) { xbox_SpeedSet(i ? 2u : 1u); }
+@@ -172,6 +175,7 @@ static const xbox_menu_item k_builtin[] = {
+     { "aniso", "Filtrado anisotrópico", k_aniso, get_aniso, set_aniso },
+     { "snap_2d", "HUD alineado a píxel", k_snap, get_snap, set_snap },
+     { "glow", "Brillo a pantalla completa", k_glow, get_glow, set_glow },
++    { "tex_dump", "Volcar texturas a carpeta", k_onoff, get_dump, set_dump },
+     { NULL, "Juego", NULL, NULL, NULL },
+     { "language", "Idioma (al reiniciar)", k_lang, get_lang, set_lang },
+     { NULL, "Velocidad", k_speed, get_speed, set_speed },
+diff --git a/src/d3d/host_menu.h b/src/d3d/host_menu.h
+index 16be522..4085fc7 100644
+--- a/src/d3d/host_menu.h
++++ b/src/d3d/host_menu.h
+@@ -46,6 +46,9 @@ const uint32_t *xbox_MenuPixels(unsigned back_h, unsigned *w, unsigned *h, unsig
+ void nv2a_d3d11_window_request(unsigned w, unsigned h);
+ /* nv2a_pb_d3d11.c: the full-screen glow off (1) or on (0); -1 only reads. */
+ int  nv2a_d3d11_glow_off(int set);
++/* nv2a_pb_d3d11.c: textures dumped as PNG (RECOMP_TEXTURES_DUMP_DIR). */
++void nv2a_d3d11_tex_dump_set(int on);
++int  nv2a_d3d11_tex_dump(void);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/src/d3d/nv2a_pb_d3d11.c b/src/d3d/nv2a_pb_d3d11.c
+index 7a822b6..009952b 100644
+--- a/src/d3d/nv2a_pb_d3d11.c
++++ b/src/d3d/nv2a_pb_d3d11.c
+@@ -1787,6 +1787,9 @@ static int no_mips(void)
+     return off;
+ }
+ 
++static void tex_free(TexEntry *e);
++static int  s_dump_flush;   /* tex_dump: drop the cache at the next draw */
++
+ /* Moves each time build_stages decodes s_stage again. */
+ static uint32_t s_stage_gen;
+ 
+@@ -1804,6 +1807,13 @@ static void build_stages(void)
+     uint32_t gen = nv2a_pb_tex_regs_gen(), contig = xbox_ContiguousAllocatedBytes();
+     int n;
+ 
++    if (s_dump_flush) {
++        /* tex dump just turned on: everything goes up (and out) again */
++        s_dump_flush = 0;
++        for (n = 0; n < TEX_CACHE; n++)
++            if (s_tc[n].live)
++                tex_free(&s_tc[n]);
++    }
+     if (memo_on() && memo.ok && memo.gen == gen && memo.prog == v->shader_prog
+         && memo.set == v->shader_set && memo.contig == contig)
+         return;
+@@ -1929,6 +1939,183 @@ static uint32_t s_tc_gen;
+ /* The entry tex_bind's last view came from (NULL for magenta or black). */
+ static TexEntry *s_tex_last;
+ 
++/* rdr-port: texture dump. RECOMP_TEXTURES_DUMP=1 (or the F2 menu) writes
++ * level 0 of every texture a pack could replace -- swizzled or DXT, not
++ * P8, not a render target -- once, as <dir>/<HASH>_<w>x<h>.png, where
++ * <dir> is RECOMP_TEXTURES_DUMP_DIR (default texturas/dump). HASH is the
++ * pack key (texture-pack.md), so an upscaled copy under the same name
++ * builds a pack (tools/texturas_pack.py). Turning it on drops the texture
++ * cache at the next draw, so what is already up is dumped too. */
++static int      s_dump_on = -1;
++static uint64_t s_dumped[8192];     /* open addressing, 0 empty */
++static unsigned s_dumped_n;
++
++static int tex_dump_on(void)
++{
++    if (s_dump_on < 0) {
++        const char *e = getenv("RECOMP_TEXTURES_DUMP");
++        s_dump_on = e && *e == '1';
++    }
++    return s_dump_on;
++}
++
++void nv2a_d3d11_tex_dump_set(int on)
++{
++    on = on != 0;
++    if (on && tex_dump_on() != on)
++        s_dump_flush = 1;
++    s_dump_on = on;
++}
++
++int nv2a_d3d11_tex_dump(void)
++{
++    return tex_dump_on();
++}
++
++static uint32_t png_crc(uint32_t c, const uint8_t *p, size_t n)
++{
++    static uint32_t tab[256];
++    size_t i;
++    if (!tab[1]) {
++        uint32_t k, v;
++        for (k = 0; k < 256; k++) {
++            v = k;
++            for (i = 0; i < 8; i++)
++                v = v & 1 ? 0xEDB88320u ^ (v >> 1) : v >> 1;
++            tab[k] = v;
++        }
++    }
++    c = ~c;
++    for (i = 0; i < n; i++)
++        c = tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
++    return ~c;
++}
++
++static void png_be32(uint8_t *p, uint32_t v)
++{
++    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
++    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
++}
++
++static void png_chunk(FILE *f, const char *type, const uint8_t *data, uint32_t n)
++{
++    uint8_t b[8];
++    uint32_t c;
++    png_be32(b, n);
++    memcpy(b + 4, type, 4);
++    fwrite(b, 1, 8, f);
++    if (n)
++        fwrite(data, 1, n, f);
++    c = png_crc(png_crc(0, (const uint8_t *)type, 4), data, n);
++    png_be32(b, c);
++    fwrite(b, 1, 4, f);
++}
++
++/* An RGBA PNG of A8R8G8B8 texels, deflate "stored" (no compression): a
++ * dump is read once by an upscaler, never shipped. */
++static int png_write(const char *path, const uint32_t *px, uint32_t w, uint32_t h)
++{
++    static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
++    size_t row = (size_t)w * 4 + 1, raw = row * h, blocks = (raw + 65534) / 65535;
++    size_t zn = 2 + raw + blocks * 5 + 4, i, o = 0;
++    uint8_t *z = (uint8_t *)malloc(zn), *line = (uint8_t *)malloc(row), ihdr[13];
++    uint32_t a = 1, b = 0, x, y;
++    size_t left = raw, in_block = 0;
++    FILE *f;
++
++    if (!z || !line) {
++        free(z);
++        free(line);
++        return 0;
++    }
++    z[o++] = 0x78;
++    z[o++] = 0x01;
++    for (y = 0; y < h; y++) {
++        line[0] = 0;
++        for (x = 0; x < w; x++) {
++            uint32_t v = px[(size_t)y * w + x];
++            line[1 + x * 4] = (uint8_t)(v >> 16);
++            line[2 + x * 4] = (uint8_t)(v >> 8);
++            line[3 + x * 4] = (uint8_t)v;
++            line[4 + x * 4] = (uint8_t)(v >> 24);
++        }
++        for (i = 0; i < row; i++) {
++            if (!in_block) {
++                size_t n = left < 65535 ? left : 65535;
++                z[o++] = left <= 65535 ? 1 : 0;
++                z[o++] = (uint8_t)n;
++                z[o++] = (uint8_t)(n >> 8);
++                z[o++] = (uint8_t)~n;
++                z[o++] = (uint8_t)(~n >> 8);
++                in_block = n;
++            }
++            z[o++] = line[i];
++            a = (a + line[i]) % 65521u;
++            b = (b + a) % 65521u;
++            in_block--;
++            left--;
++        }
++    }
++    png_be32(z + o, (b << 16) | a);
++    o += 4;
++    free(line);
++    f = fopen(path, "wb");
++    if (!f) {
++        free(z);
++        return 0;
++    }
++    fwrite(sig, 1, 8, f);
++    png_be32(ihdr, w);
++    png_be32(ihdr + 4, h);
++    ihdr[8] = 8;    /* bits */
++    ihdr[9] = 6;    /* RGBA */
++    ihdr[10] = ihdr[11] = ihdr[12] = 0;
++    png_chunk(f, "IHDR", ihdr, 13);
++    png_chunk(f, "IDAT", z, (uint32_t)o);
++    png_chunk(f, "IEND", NULL, 0);
++    fclose(f);
++    free(z);
++    return 1;
++}
++
++/* s_texels' level 0 of t, under the pack key `hash`. */
++static void tex_dump(const Stage *t, uint64_t hash)
++{
++    static char dir[512];
++    char path[640];
++    unsigned i;
++
++    if (!tex_dump_on() || !nv2a_tex_size_from_format(t->color) || t->color == NV2A_TEX_P8
++            || !hash || s_dumped_n >= 8192 * 3 / 4)
++        return;
++    for (i = (unsigned)(hash * 0x9E3779B97F4A7C15ull >> 51); s_dumped[i]; i = (i + 1) & 8191)
++        if (s_dumped[i] == hash)
++            return;
++    s_dumped[i] = hash;
++    s_dumped_n++;
++    if (!dir[0]) {
++        const char *e = getenv("RECOMP_TEXTURES_DUMP_DIR");
++        snprintf(dir, sizeof dir, "%s", e && *e ? e : "texturas\\dump");
++        for (i = 1; dir[i]; i++)      /* every level of the path */
++            if (dir[i] == '\\' || dir[i] == '/') {
++                char c = dir[i];
++                dir[i] = 0;
++                CreateDirectoryA(dir, NULL);
++                dir[i] = c;
++            }
++        CreateDirectoryA(dir, NULL);
++    }
++    snprintf(path, sizeof path, "%s\\%016llX_%ux%u.png", dir, (unsigned long long)hash,
++             t->width, t->height);
++    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
++        return;     /* an earlier run's */
++    if (png_write(path, s_texels, t->width, t->height)) {
++        static unsigned said;
++        if (said++ < 3)
++            fprintf(stderr, LOGP "texture dump: %s\n", path);
++    }
++}
++
+ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
+ {
+     s_tc_gen++;
+@@ -1961,6 +2148,7 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
+         if (!decode_texture(t) || !tex_alloc(e, width, height, levels, 0))
+             return 0;
+         src = s_texels;
++        tex_dump(t, hash);
+     }
+     /* BC3 levels go up as they are, one row of 4x4 blocks per pitch. */
+     p = (const uint8_t *)src;
+@@ -2117,7 +2305,22 @@ static struct { uint64_t key; uint32_t border; ID3D11SamplerState *s; } s_smp[SM
+ static int s_smp_n;
+ static int s_smp_last[4];   /* per stage: the entry it got last */
+ 
+-static ID3D11SamplerState *sampler(const Stage *t, int bump_source)
++/* rdr-port: a pack entry larger than its guest texture (an upscale) has
++ * that many more levels at the top: the guest's LOD clamps are moved by
++ * them, and one made with mips is mipmapped even where the guest texture
++ * had none. Bits 0-3 the extra levels, bit 4 the entry has mips; 0 for
++ * the guest's own texels. */
++static unsigned tex_pack_lod(const TexEntry *e)
++{
++    unsigned x = 0;
++    if (!e || !e->tex || e->tex_w <= e->width || !e->width)
++        return 0;
++    while (x < 15 && ((uint64_t)e->width << (x + 1)) <= e->tex_w)
++        x++;
++    return x | (e->tex_levels > 1 ? 0x10u : 0u);
++}
++
++static ID3D11SamplerState *sampler(const Stage *t, int bump_source, unsigned pk)
+ {
+     static int point = -1;
+     static ID3D11SamplerState *fallback;
+@@ -2134,12 +2337,14 @@ static ID3D11SamplerState *sampler(const Stage *t, int bump_source)
+     mn = !point && filter_linear(t->filter, 0);
+     mg = !point && filter_linear(t->filter, 1);
+     mip = t->levels > 1 ? filter_mip(t->filter) : 0;
++    if ((pk & 0x10u) && !mip && mn)
++        mip = 2;    /* an upscale with mips over a texture without: blend levels */
+     /* render.aniso: anisotropic filtering on the world's surfaces, seen at
+      * an angle (nv2a_stage_aniso has the rule). In the key, so a stage that
+      * is a bump source in one draw and plain in the next gets its own. */
+     an = nv2a_stage_aniso(t, mip, mn, bump_source);
+     key = u | v << 4 | (uint64_t)mn << 8 | (uint64_t)mg << 9
+-        | (uint64_t)mip << 10 | (uint64_t)an << 35;
++        | (uint64_t)mip << 10 | (uint64_t)an << 35 | (uint64_t)pk << 40;
+     if (mip)
+         key |= (uint64_t)(t->filter & 0x1FFFu) << 12
+              | (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
+@@ -2166,11 +2371,19 @@ static ID3D11SamplerState *sampler(const Stage *t, int bump_source)
+     sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+     nv2a_argb_to_float4(border, sd.BorderColor);
+     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+-    sd.MipLODBias = mip ? lod_bias(t->filter) : 0.0f;
++    sd.MipLODBias = mip && t->levels > 1 ? lod_bias(t->filter) : 0.0f;
+     if (sd.MipLODBias > 15.99f) sd.MipLODBias = 15.99f;
+     if (sd.MipLODBias < -16.0f) sd.MipLODBias = -16.0f;
+     sd.MinLOD = mip ? (float)t->lod_min : 0.0f;
+     sd.MaxLOD = mip ? (float)t->lod_max : 0.0f;
++    if (pk) {
++        /* the guest's level k is the entry's k + extra; its base level
++         * (lod_min 0) lets the entry's finer levels show */
++        unsigned x = pk & 0xFu;
++        sd.MinLOD = t->levels > 1 && t->lod_min ? (float)(t->lod_min + x) : 0.0f;
++        sd.MaxLOD = t->levels > 1 ? (float)(t->lod_max + x)
++                                  : (pk & 0x10u) ? D3D11_FLOAT32_MAX : 0.0f;
++    }
+     ID3D11Device_CreateSamplerState(s_dev, &sd, &st);
+     if (!st)
+         return fallback;
+@@ -2615,7 +2828,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
+             s_stage_src[n] = lm.src[n];
+             if (lm.e[n])
+                 lm.e[n]->used = ++s_tc_clock;   /* the LRU sees the use */
+-            smp[n] = sampler(&s_stage[n], bump_src >> n & 1);
++            smp[n] = sampler(&s_stage[n], bump_src >> n & 1, tex_pack_lod(lm.e[n]));
+         }
+         textured = lm.textured;
+         s_loop_hits++;
+@@ -2644,7 +2857,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
+         } else {
+             srv[n] = s_black_srv;
+         }
+-        smp[n] = sampler(t, bump_src >> n & 1);
++        smp[n] = sampler(t, bump_src >> n & 1, src ? 0u : tex_pack_lod(lm.e[n]));
+     }
+     if (!lhit) {
+         /* Taken after the loop: tex_bind's own uploads moved the counters. */
+-- 
+2.55.0.windows.3
+
