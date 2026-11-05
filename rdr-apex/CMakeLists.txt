@@ -64,6 +64,7 @@ set(GAME_SOURCES
     src/widescreen.c
     src/movies.c
     src/mando_directo.c
+    src/f2_idiomas.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c

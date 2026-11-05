@@ -1066,3 +1066,15 @@ Lista vieja:
   coinciden; donde la fuente de Windows no tiene un carácter queda el del juego. La fuente de la tienda no tiene
   acentos ni en el juego original. Subtítulos: siempre prendidos en todos los idiomas (F2). Pendiente: el menú F2
   sigue solo en español.
+
+## Menú F2 en 6 idiomas (2026-11-05, compilado, sin probar en el juego)
+
+- **Fork, patch 0052 (`8631c2d`):** `xbox_MenuSetTranslator(tr)`; el panel pasa por `TR()` lo que muestra (título,
+  "F2 / Esc", ayuda, secciones, filas, la opción elegida y los avisos de `xbox_MenuToast`). `rdr_menu.ini` sigue
+  con los valores en español (save/load sin cambios). El ancho del panel crece hasta la etiqueta y la opción más
+  largas del idioma (medido una vez por tamaño de letra); el aviso mide en UTF-16 (`text_w`).
+- **`rdr-apex/src/f2_idiomas.c`:** tabla español → inglés, portugués, francés, alemán, italiano (~50 textos: las
+  filas de `host_menu.c`, `main.c` y `mouselook.c`, sus opciones, el panel y los avisos de F6). Idioma: el de
+  `launcher.ini` (selector de Configuración.exe); si no hay, el de Windows; si no es ninguno de los 6, inglés.
+  Registro: `[MENU] language: xx`. Se llama desde `main.c` antes de `xbox_MenuLoad`.
+- Exe copiado a la carpeta final, zip de release rehecho. Copias previas en `modding/backup_f2_idiomas/`.

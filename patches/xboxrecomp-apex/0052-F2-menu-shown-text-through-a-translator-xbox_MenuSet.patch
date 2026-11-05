@@ -1,0 +1,174 @@
+From 8631c2d1fc61f84b0b6bdfbe2bc1a025b1c7ff3f Mon Sep 17 00:00:00 2001
+From: adrianelmanya76 <adrianelmanya76@gmail.com>
+Date: Thu, 5 Nov 2026 07:52:27 -0300
+Subject: [PATCH] F2 menu: shown text through a translator
+ (xbox_MenuSetTranslator); panel as wide as the longest label and choice;
+ toast width in UTF-16
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/host_menu.c | 77 ++++++++++++++++++++++++++++++++++++++++-----
+ src/d3d/host_menu.h |  5 +++
+ 2 files changed, 74 insertions(+), 8 deletions(-)
+
+diff --git a/src/d3d/host_menu.c b/src/d3d/host_menu.c
+index cecc9af..fec1148 100644
+--- a/src/d3d/host_menu.c
++++ b/src/d3d/host_menu.c
+@@ -32,6 +32,14 @@ static const xbox_menu_item *s_items[ITEMS_MAX];
+ static int  s_n, s_sel = -1, s_open, s_loading;
+ static char s_path[MAX_PATH];
+ 
++/* rdr-port: the shown text in the player's language (xbox_MenuSetTranslator). */
++static const char *(*s_tr)(const char *);
++static const char *TR(const char *s)
++{
++    const char *t = s && s_tr ? s_tr(s) : NULL;
++    return t ? t : s;
++}
++
+ /* ---- the runtime's rows ------------------------------------------------- */
+ 
+ static const char *const k_scale[] = {
+@@ -493,9 +501,26 @@ out:
+ static char      s_toast[96];
+ static ULONGLONG s_toast_until;
+ 
++void xbox_MenuSetTranslator(const char *(*tr)(const char *utf8))
++{
++    s_tr = tr;
++    s_sig = 0;
++}
++
++/* The width of utf8 in the DC's selected font, in pixels (0 if GDI fails). */
++static int text_w(const char *utf8)
++{
++    wchar_t wb[160];
++    SIZE sz;
++    int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wb, 160);
++    if (n <= 1 || !GetTextExtentPoint32W(s_dc, wb, n - 1, &sz))
++        return 0;
++    return (int)sz.cx;
++}
++
+ void xbox_MenuToast(const char *utf8, unsigned ms)
+ {
+-    snprintf(s_toast, sizeof s_toast, "%s", utf8);
++    snprintf(s_toast, sizeof s_toast, "%s", TR(utf8));
+     s_toast_until = GetTickCount64() + ms;
+     s_sig = 0;
+ }
+@@ -516,7 +541,10 @@ static const uint32_t *toast_pixels(unsigned back_h, unsigned *w, unsigned *h, u
+     if (!make_fonts(fpx))
+         return NULL;
+     SelectObject(s_dc, s_font_big);
+-    W = GetTextExtentPoint32A(s_dc, s_toast, (int)strlen(s_toast), &sz) ? (unsigned)sz.cx : fpx * 20u;
++    (void)sz;
++    W = (unsigned)text_w(s_toast);
++    if (!W)
++        W = fpx * 20u;
+     W += fpx * 2u;
+     H = fpx * 2u;
+     if (!make_surface(W, H, fpx))
+@@ -567,6 +595,39 @@ const uint32_t *xbox_MenuPixels(unsigned back_h, unsigned *w, unsigned *h, unsig
+     row = fpx * 17u / 10u;
+     pad = fpx;
+     W = fpx * 30u;
++    {
++        /* rdr-port: wide enough for the longest label beside its longest
++         * choice in the shown language (German runs long); measured once a
++         * size and translator. */
++        static unsigned w_for_px;
++        static const void *w_for_tr;
++        static unsigned w_need;
++        if (w_for_px != fpx || w_for_tr != (const void *)s_tr) {
++            int lw = 0, vw = 0, j, c;
++            if (!make_fonts(fpx))
++                return NULL;
++            SelectObject(s_dc, s_font);
++            for (j = 0; j < s_n; j++) {
++                const xbox_menu_item *it = s_items[j];
++                char v[128];
++                int t;
++                if (!it->choices)
++                    continue;
++                t = text_w(TR(it->label));
++                if (t > lw) lw = t;
++                for (c = 0; it->choices[c]; c++) {
++                    snprintf(v, sizeof v, "‹  %s  ›", TR(it->choices[c]));
++                    t = text_w(v);
++                    if (t > vw) vw = t;
++                }
++            }
++            w_need = (unsigned)(lw + vw) + pad * 2u + fpx * 2u;
++            w_for_px = fpx;
++            w_for_tr = (const void *)s_tr;
++        }
++        if (w_need > W)
++            W = w_need;
++    }
+     H = pad * 2u + row * 2u + (unsigned)s_n * row + row * 3u / 2u;
+ 
+     /* Redraw only when something shown moved. */
+@@ -584,16 +645,16 @@ const uint32_t *xbox_MenuPixels(unsigned back_h, unsigned *w, unsigned *h, unsig
+     fill(0, 0, (int)W, (int)H, RGB(18, 14, 12));
+     fill(0, 0, (int)W, 3, RGB(170, 70, 40));
+     SelectObject(s_dc, s_font_big);
+-    text((int)pad, (int)pad, (int)(W - 2 * pad), (int)row, "AJUSTES", DT_LEFT, RGB(235, 195, 125));
++    text((int)pad, (int)pad, (int)(W - 2 * pad), (int)row, TR("AJUSTES"), DT_LEFT, RGB(235, 195, 125));
+     SelectObject(s_dc, s_font_small);
+-    text((int)pad, (int)pad, (int)(W - 2 * pad), (int)row, "F2 / Esc: cerrar", DT_RIGHT,
++    text((int)pad, (int)pad, (int)(W - 2 * pad), (int)row, TR("F2 / Esc: cerrar"), DT_RIGHT,
+          RGB(150, 140, 130));
+     y = (int)(pad + row + row / 2);
+     for (i = 0; i < s_n; i++, y += (int)row) {
+         const xbox_menu_item *it = s_items[i];
+         if (!it->choices) {
+             SelectObject(s_dc, s_font_small);
+-            text((int)pad, y, (int)(W - 2 * pad), (int)row, it->label, DT_LEFT | DT_BOTTOM,
++            text((int)pad, y, (int)(W - 2 * pad), (int)row, TR(it->label), DT_LEFT | DT_BOTTOM,
+                  RGB(200, 110, 70));
+             fill((int)pad, y + (int)row - 2, (int)(W - 2 * pad), 1, RGB(90, 50, 35));
+             continue;
+@@ -601,19 +662,19 @@ const uint32_t *xbox_MenuPixels(unsigned back_h, unsigned *w, unsigned *h, unsig
+         if (i == s_sel)
+             fill((int)pad / 2, y + 1, (int)(W - pad), (int)row - 2, RGB(125, 38, 26));
+         SelectObject(s_dc, s_font);
+-        text((int)pad, y, (int)(W - 2 * pad), (int)row, it->label, DT_LEFT,
++        text((int)pad, y, (int)(W - 2 * pad), (int)row, TR(it->label), DT_LEFT,
+              i == s_sel ? RGB(255, 255, 255) : RGB(215, 210, 200));
+         {
+             char v[128];
+             int c = it->get(), n = choice_count(it);
+-            snprintf(v, sizeof v, "‹  %s  ›", c >= 0 && c < n ? it->choices[c] : "?");
++            snprintf(v, sizeof v, "‹  %s  ›", c >= 0 && c < n ? TR(it->choices[c]) : "?");
+             text((int)pad, y, (int)(W - 2 * pad), (int)row, v, DT_RIGHT,
+                  i == s_sel ? RGB(255, 225, 150) : RGB(225, 185, 120));
+         }
+     }
+     SelectObject(s_dc, s_font_small);
+     text((int)pad, y + (int)row / 4, (int)(W - 2 * pad), (int)row,
+-         "↑↓ elegir   ←→ cambiar   (se guarda solo)", DT_LEFT, RGB(150, 140, 130));
++         TR("↑↓ elegir   ←→ cambiar   (se guarda solo)"), DT_LEFT, RGB(150, 140, 130));
+     GdiFlush();
+     /* GDI leaves alpha at 0: the whole panel at 92%. */
+     for (i = 0; i < (int)(W * H); i++)
+diff --git a/src/d3d/host_menu.h b/src/d3d/host_menu.h
+index 56ae491..51d2639 100644
+--- a/src/d3d/host_menu.h
++++ b/src/d3d/host_menu.h
+@@ -29,6 +29,11 @@ typedef struct xbox_menu_item {
+     void (*set)(int i);            /* apply choice i */
+ } xbox_menu_item;
+ 
++/* rdr-port: what the panel shows goes through tr (a row's label, its choice,
++ * the header and help lines, a toast), which returns the text in the
++ * player's language or NULL to keep it. rdr_menu.ini keeps the choices as
++ * the rows spell them, whatever is shown. */
++void xbox_MenuSetTranslator(const char *(*tr)(const char *utf8));
+ /* Adds a row (the struct is kept by pointer: give it static storage). */
+ void xbox_MenuAdd(const xbox_menu_item *it);
+ /* Applies the choices saved in path and saves every later change there. */
+-- 
+2.55.0.windows.3
+

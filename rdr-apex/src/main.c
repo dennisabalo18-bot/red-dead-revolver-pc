@@ -1250,6 +1250,11 @@ static int host_main(void)
     if (nv2a_tex_pack_count())
         pack_menu_init();
     fast_menu_init();
+    {
+        /* The F2 menu in the launcher's language (f2_idiomas.c). */
+        extern void f2_idiomas_init(void);
+        f2_idiomas_init();
+    }
     /* The F2 menu's saved choices (d3d/host_menu.h) over env.bat's. */
     {
         extern void xbox_MenuLoad(const char *path);
