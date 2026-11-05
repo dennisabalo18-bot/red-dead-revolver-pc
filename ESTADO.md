@@ -1078,3 +1078,11 @@ Lista vieja:
   `launcher.ini` (selector de Configuración.exe); si no hay, el de Windows; si no es ninguno de los 6, inglés.
   Registro: `[MENU] language: xx`. Se llama desde `main.c` antes de `xbox_MenuLoad`.
 - Exe copiado a la carpeta final, zip de release rehecho. Copias previas en `modding/backup_f2_idiomas/`.
+- **Idioma mezclado (reporte del usuario, 2026-11-05):** "probé el principio en inglés y me apareció el cargando y
+  las cosas de Rockstar en italiano". Registro: arrancó en español (`language=Español` en el ini; el launcher en
+  inglés no cambiaba el idioma del juego); en F2, durante el arranque, pasó de Español a English y a Italiano
+  (izquierda dos veces). La fila "Idioma (al reiniciar)" aplicaba el cambio en el acto y el juego lo tomó a mitad
+  del arranque. **Arreglo (fork, patch 0053 `9ee14d6`):** `set_lang` solo aplica el idioma al cargar el ini (antes
+  de que corra el juego); desde el menú guarda la elección (`s_lang_choice`) para el próximo arranque.
+  **Launcher:** elegir su idioma también pone "Idioma del juego" en ese idioma (portugués: lo deja como está).
+  Exe y launcher copiados a la carpeta final; zip rehecho.

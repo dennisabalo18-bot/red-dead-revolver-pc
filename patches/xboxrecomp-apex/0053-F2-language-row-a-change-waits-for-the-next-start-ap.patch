@@ -1,0 +1,47 @@
+From 9ee14d67e40c817a05e07f0f6a389e69938f274c Mon Sep 17 00:00:00 2001
+From: adrianelmanya76 <adrianelmanya76@gmail.com>
+Date: Thu, 5 Nov 2026 07:56:54 -0300
+Subject: [PATCH] F2 language row: a change waits for the next start (applied
+ at once, the game took it mid-boot)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/host_menu.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/d3d/host_menu.c b/src/d3d/host_menu.c
+index fec1148..0ca357b 100644
+--- a/src/d3d/host_menu.c
++++ b/src/d3d/host_menu.c
+@@ -83,15 +83,27 @@ static void set_wide(int i) { xbox_VideoWidescreenSet(i); }
+ /* XC_LANGUAGE (kernel.h): the title picks its text and voices at boot. */
+ static const char *const k_lang[] = { "English", "Español", "Français", "Deutsch", "Italiano", NULL };
+ static const int k_lang_id[] = { 1, 5, 4, 3, 6 };
++/* rdr-port: a change from the menu waits for the next start, as its label
++ * says: applied at once, the game took it mid-boot (a player cycling past
++ * English got the legal screen and the loading text in Italian). Only the
++ * saved choice (xbox_MenuLoad, before the game runs) sets the language. */
++static int s_lang_choice = -1;
+ static int get_lang(void)
+ {
+     int i;
++    if (s_lang_choice >= 0)
++        return s_lang_choice;
+     for (i = 0; i < 5; i++)
+         if (k_lang_id[i] == xbox_Language())
+             return i;
+     return 0;
+ }
+-static void set_lang(int i) { xbox_LanguageSet(k_lang_id[i]); }
++static void set_lang(int i)
++{
++    s_lang_choice = i;
++    if (s_loading)
++        xbox_LanguageSet(k_lang_id[i]);
++}
+ 
+ static const char *const k_window[] = {
+     "Libre", "640x480", "800x600", "960x720", "1024x768", "1280x720", "1280x960",
+-- 
+2.55.0.windows.3
+

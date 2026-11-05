@@ -459,6 +459,12 @@ class Launcher : Form
             if (langBox.SelectedIndex < 0 || langBox.SelectedIndex == Tr.Lang) return;
             Tr.Lang = langBox.SelectedIndex;
             SaveLang();
+            // The game's language follows (Portuguese: the game has none, left as it is);
+            // the player can still pick another below.
+            if (Tr.Codes[Tr.Lang] != "pt") {
+                var lang = All().First(o => o.Key == "language");
+                lang.Box.SelectedIndex = Array.IndexOf(lang.Choices, GameLangDefault());
+            }
             BeginInvoke((MethodInvoker)delegate { BuildContent(); Refresh_(); });
         };
         body.Controls.AddRange(new Control[] { title, sub, bar, langLbl, langBox });
