@@ -1046,3 +1046,23 @@ Lista vieja:
 - README (inglés y español) y LEEME del jugador: solo la versión PAL, con el tamaño del `default.xbe`.
 - Exe y LEEME copiados a la carpeta final; `RedDeadRevolverPC.zip` rehecho (hay que reemplazarlo en el Release).
   Copias previas en `modding/backup_chequeo_xbe/`.
+
+## Configuración.exe en 6 idiomas; revisión de los idiomas del juego (2026-11-05)
+
+- **Launcher:** español, inglés, portugués, francés, alemán e italiano (los 5 del juego + portugués). Selector
+  arriba a la derecha; se guarda en `launcher.ini` (`idioma=xx`) junto al exe; la primera vez sigue al idioma de
+  Windows (otro idioma: inglés). Cambiarlo rehace la ventana sin perder lo elegido. Textos en `Tr.T` (id → 6
+  idiomas), valores mostrados en `Tr.V`: `rdr_menu.ini` sigue guardando los valores del F2 en español (el F2 los
+  compara por texto). Tooltip con nombre y explicación de cada opción. "Valores por defecto" pone el idioma del
+  juego según el del launcher (portugués → español; el juego no trae portugués).
+- **Aviso de versión también en el launcher:** si el `default.xbe` no pesa 4.452.352 bytes, la línea del juego lo
+  dice en rojo.
+- Verificado abriendo el launcher en una carpeta de prueba en alemán y francés (los textos más largos): entra todo.
+  Copia previa en `modding/backup_launcher_idiomas/`. Copiado a la carpeta final; zip de release rehecho.
+- **Idiomas del juego (revisión estática; el juego no se abrió):** los textos de los 5 idiomas están en los mismos
+  archivos (no hay archivos por idioma). Lo que el port cambia según el idioma: las letras redibujadas
+  (`letras_vector`) y los botones. Se compararon las letras redibujadas con las del juego en las 4 fuentes:
+  acentos y letras de francés, alemán, italiano y español (é è ê ë à ç ñ ß ä ö ü ø æ œ ¿ ¡ € …) están todas y
+  coinciden; donde la fuente de Windows no tiene un carácter queda el del juego. La fuente de la tienda no tiene
+  acentos ni en el juego original. Subtítulos: siempre prendidos en todos los idiomas (F2). Pendiente: el menú F2
+  sigue solo en español.
